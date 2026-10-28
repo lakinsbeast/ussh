@@ -391,6 +391,10 @@ struct Client {
     backoff: Duration,
     last_error: String,
     overlay_drawn: Option<Instant>,
+    /// What the terminal shows, so we can repaint without asking the server.
+    mirror: vt100::Parser,
+    hist_have: u64,
+    hist_pending: Vec<String>,
 }
 
 enum Exit {
@@ -405,7 +409,10 @@ fn run(o: Opts, boot: Boot) -> Result<String, String> {
 
     let raw = term::RawMode::enter().map_err(|e| format!("raw mode: {e}"))?;
     let mut out = io::stdout();
-    let _ = out.write_all(b"\x1b[?1049h\x1b[H\x1b[2J");
+    // No alternate screen: scrolled-off rows go into the terminal's own
+    // scrollback. Push whatever is on screen now up into it first.
+    let (cols0, rows0) = term::size();
+    let _ = write!(out, "\x1b[999;1H{}\x1b[H", "\r\n".repeat(rows0 as usize));
     let _ = out.flush();
 
     // Keyboard.
@@ -477,6 +484,9 @@ fn run(o: Opts, boot: Boot) -> Result<String, String> {
         backoff: Duration::from_secs(1),
         last_error: String::new(),
         overlay_drawn: None,
+        mirror: vt100::Parser::new(crate::history::nz(rows0), crate::history::nz(cols0), 0),
+        hist_have: 0,
+        hist_pending: Vec::new(),
     };
     let ip = resolved.or(boot.server_ip);
     c.server = ip.map(|ip| SocketAddr::new(ip, boot.port));
@@ -510,8 +520,9 @@ impl Client {
     fn finish(mut self, raw: term::RawMode, exit: Exit) -> String {
         self.relay = None;
         let _ = self.out.write_all(
-            b"\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1l\x1b>\x1b[?25h\x1b[?1049l",
+            b"\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1l\x1b>\x1b[?25h\x1b[?2026l",
         );
+        let _ = write!(self.out, "\x1b[{};1H\r\n", self.rows);
         let _ = self.out.flush();
         drop(raw);
         match exit {
@@ -679,12 +690,8 @@ impl Client {
         self.backoff = Duration::from_secs(1);
         let mut reply = false;
         if self.overlay_drawn.take().is_some() {
-            // Back in contact: our screen has the banner on it, so ask for a
-            // full redraw.
-            self.epoch += 1;
-            self.version = 0;
-            self.frags.clear();
-            reply = true;
+            // Back in contact: paint over the banner from our mirror.
+            self.redraw_local();
         }
         if msg.flags & FLAG_ENDED != 0 {
             return Some(Exit::Ended);
@@ -714,7 +721,15 @@ impl Client {
                     let a = self.frags.remove(&f.new).unwrap();
                     let data: Vec<u8> = a.parts.into_iter().flatten().flatten().collect();
                     if let Some(bytes) = proto::inflate(&data) {
+                        let (mr, mc) = self.mirror.screen().size();
+                        if (mr.get(), mc.get()) != (f.rows, f.cols) {
+                            self.mirror.set_size(crate::history::nz(f.rows), crate::history::nz(f.cols));
+                        }
+                        self.mirror.process(&bytes);
+                        // Synchronized output: the terminal shows the frame whole.
+                        let _ = self.out.write_all(b"\x1b[?2026h");
                         let _ = self.out.write_all(&bytes);
+                        let _ = self.out.write_all(b"\x1b[?2026l");
                         let _ = self.out.flush();
                         crate::dlog!("cli apply {}->{}", a.base, f.new);
                         self.version = f.new;
@@ -730,10 +745,65 @@ impl Client {
                 }
             }
         }
+        if let Some(h) = msg.hist {
+            if let Some(text) = proto::inflate(&h.data) {
+                let text = String::from_utf8_lossy(&text);
+                let lines: Vec<&str> = text.split('\n').collect();
+                let end = h.start + lines.len() as u64;
+                if h.start <= self.hist_have && end > self.hist_have {
+                    let skip = (self.hist_have - h.start) as usize;
+                    self.hist_pending.extend(lines[skip..].iter().map(|l| l.to_string()));
+                    self.hist_have = end;
+                } else if h.skip && h.start > self.hist_have {
+                    if self.hist_have != 0 {
+                        let n = h.start - self.hist_have;
+                        self.hist_pending.push(format!("\x1b[2m··· {n} lines skipped · Ctrl-^ h to browse them ···"));
+                    }
+                    self.hist_pending.extend(lines.iter().map(|l| l.to_string()));
+                    self.hist_have = end;
+                }
+            }
+            reply = true;
+        }
         if reply {
             self.send(now);
         }
         None
+    }
+
+    /// Repaint the terminal from the mirror.
+    fn redraw_local(&mut self) {
+        let s = self.mirror.screen().contents_formatted();
+        let _ = write!(self.out, "\x1b[?2026h{s}\x1b[?2026l");
+        let _ = self.out.flush();
+    }
+
+    /// Push pending history rows into the terminal's native scrollback: draw
+    /// them from the top and scroll them off, then repaint the screen.
+    fn flush_history(&mut self) {
+        if self.hist_pending.is_empty() {
+            return;
+        }
+        let lines = std::mem::take(&mut self.hist_pending);
+        let (rows, cols) = (self.rows.max(2) as usize, self.cols.max(1) as usize);
+        let mut s = String::from("\x1b[?2026h\x1b[0m\x1b[r");
+        for r in 1..=rows {
+            s.push_str(&format!("\x1b[{r};1H\x1b[2K"));
+        }
+        s.push_str("\x1b[1;1H");
+        let mut phys = 0;
+        for l in &lines {
+            s.push_str(l);
+            s.push_str("\x1b[0m\r\n");
+            let plain: String = vt100::capture::basic_formatted_to_plain(l).collect();
+            let w = unicode_width::UnicodeWidthStr::width(plain.as_str());
+            phys += w.div_ceil(cols).max(1);
+        }
+        s.push_str(&format!("\x1b[{rows};1H{}", "\n".repeat(phys.min(rows - 1))));
+        s.push_str(&self.mirror.screen().contents_formatted());
+        s.push_str("\x1b[?2026l");
+        let _ = self.out.write_all(s.as_bytes());
+        let _ = self.out.flush();
     }
 
     fn send(&mut self, now: Instant) {
@@ -758,6 +828,7 @@ impl Client {
                     input: data.to_vec(),
                     cols: self.cols,
                     rows: self.rows,
+                    hist_have: self.hist_have,
                 }
                 .encode();
                 self.seq += 1;
@@ -783,6 +854,9 @@ impl Client {
 
     fn tick(&mut self) {
         let now = Instant::now();
+        if self.overlay_drawn.is_none() {
+            self.flush_history();
+        }
         if let Some(every) = self.knobs.roam {
             if now.duration_since(self.last_roam) >= every {
                 self.rebind_udp();

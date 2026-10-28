@@ -10,7 +10,7 @@
 
 use crate::crypto::{self, Keys, DIR_TO_CLIENT};
 use crate::history::{self, Hooks, KeyResult, Viewer};
-use crate::proto::{self, ClientMsg, Frame, ServerMsg, ESC_BYTE, FLAG_ENDED, FLAG_SUPERSEDED, MAX_FRAG};
+use crate::proto::{self, ClientMsg, Frame, Hist, ServerMsg, ESC_BYTE, FLAG_ENDED, FLAG_SUPERSEDED, MAX_FRAG};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -23,6 +23,13 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const PORT_RANGE: std::ops::RangeInclusive<u16> = 60001..=61000;
+/// Lines of history a newly attached client gets in its scrollback.
+const HIST_SEED: u64 = 1000;
+/// History lines in flight before waiting for acks.
+const HIST_WINDOW: u64 = 600;
+/// Backlog that counts as a flood, and how much of it to keep.
+const HIST_SKIP_AT: u64 = 3000;
+const HIST_SKIP_TO: u64 = 300;
 
 pub fn main(args: &[String]) -> i32 {
     let r = match args.first().map(String::as_str) {
@@ -248,6 +255,13 @@ struct Session {
     /// Frames sent back-to-back; a long streak means bulk output.
     frame_streak: u32,
     rto_anchor: Instant,
+    /// History streaming: client has everything below `hist_have`; we've
+    /// sent up to `hist_sent`; nothing below `hist_floor` will be sent.
+    hist_have: u64,
+    hist_sent: u64,
+    hist_floor: u64,
+    hist_reported: u64,
+    hist_anchor: Instant,
     last_input_at: Option<Instant>,
     clip_acked: u64,
     srtt_ms: Option<f64>,
@@ -399,6 +413,11 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
         last_frame_at: now,
         frame_streak: 0,
         rto_anchor: now,
+        hist_have: 0,
+        hist_sent: 0,
+        hist_floor: 0,
+        hist_reported: 0,
+        hist_anchor: now,
         last_input_at: None,
         clip_acked: 0,
         srtt_ms: None,
@@ -412,7 +431,7 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
 
     loop {
         let loop_start = Instant::now();
-        let busy = s.dirty || s.last_sent > s.acked || s.ack_pending || s.ended.is_some();
+        let busy = s.dirty || s.last_sent > s.acked || s.ack_pending || s.ended.is_some() || s.hist_pending();
         let timeout = if busy { Duration::from_millis(1) } else { Duration::from_millis(100) };
         match rx.recv_timeout(timeout) {
             Ok(ev) => s.handle(ev),
@@ -538,7 +557,7 @@ impl Session {
         if hdr.generation != self.cur_gen {
             // An older client: tell it someone else took over.
             g.seq += 1;
-            let msg = ServerMsg { flags: FLAG_SUPERSEDED, input_ack: 0, frame: None }.encode();
+            let msg = ServerMsg { flags: FLAG_SUPERSEDED, input_ack: 0, frame: None, hist: None }.encode();
             let out = g.keys.seal(&self.mask, hdr.generation, DIR_TO_CLIENT | g.seq, &msg);
             let _ = self.udp.send_to(&out, from);
             return;
@@ -569,6 +588,14 @@ impl Session {
             self.input_expected = msg.input_off;
             self.esc_pending = false;
             self.reset_sync(now);
+            // Seed the new client's scrollback with recent history only.
+            let hooks = self.parser.callbacks();
+            let end = hooks.dropped + hooks.lines.len() as u64;
+            self.hist_floor = end.saturating_sub(HIST_SEED).max(hooks.dropped);
+            self.hist_have = self.hist_floor;
+            self.hist_sent = self.hist_floor;
+            self.hist_reported = 0;
+            self.hist_anchor = now;
         } else if msg.epoch > self.epoch {
             self.epoch = msg.epoch;
             self.reset_sync(now);
@@ -591,6 +618,14 @@ impl Session {
             self.snaps = keep;
             self.sent_at.retain(|v, _| *v >= msg.ack);
         }
+
+        self.hist_reported = self.hist_reported.max(msg.hist_have);
+        let have = msg.hist_have.max(self.hist_floor);
+        if have > self.hist_have {
+            self.hist_have = have;
+            self.hist_anchor = now;
+        }
+        self.hist_sent = self.hist_sent.max(self.hist_have);
 
         let off = msg.input_off;
         let end = off + msg.input.len() as u64;
@@ -719,16 +754,20 @@ impl Session {
         let count = payload.len().div_ceil(MAX_FRAG).max(1);
         for idx in 0..count {
             let chunk = &payload[(idx * MAX_FRAG).min(payload.len())..((idx + 1) * MAX_FRAG).min(payload.len())];
-            let frame = Frame { base, new, idx: idx as u16, count: count as u16, data: chunk.to_vec() };
-            self.send_msg(0, Some(frame));
+            let (rows, cols) = self.snaps.get(&new).map_or((self.rows, self.cols), |s| {
+                let (r, c) = s.screen.size();
+                (r.get(), c.get())
+            });
+            let frame = Frame { base, new, idx: idx as u16, count: count as u16, rows, cols, data: chunk.to_vec() };
+            self.send_msg(0, Some(frame), None);
         }
         self.last_send = now;
         self.ack_pending = false;
     }
 
-    fn send_msg(&mut self, flags: u8, frame: Option<Frame>) {
+    fn send_msg(&mut self, flags: u8, frame: Option<Frame>, hist: Option<Hist>) {
         let Some(g) = self.gens.get_mut(&self.cur_gen) else { return };
-        let msg = ServerMsg { flags, input_ack: self.input_expected, frame }.encode();
+        let msg = ServerMsg { flags, input_ack: self.input_expected, frame, hist }.encode();
         g.seq += 1;
         let wire = g.keys.seal(&self.mask, self.cur_gen, DIR_TO_CLIENT | g.seq, &msg);
         for (addr, _) in &self.peers {
@@ -748,7 +787,7 @@ impl Session {
                 self.send_new_frame(base, now);
             }
             if now.duration_since(self.last_send) > Duration::from_millis(200) {
-                self.send_msg(FLAG_ENDED, None);
+                self.send_msg(FLAG_ENDED, None, None);
                 self.last_send = now;
             }
             return now.duration_since(t) > Duration::from_secs(3) || self.peers.is_empty();
@@ -803,10 +842,64 @@ impl Session {
             self.send_new_frame(base, now);
         } else if self.ack_pending || since_send >= Duration::from_millis(500) {
             crate::dlog!("srv heartbeat");
-            self.send_msg(0, None);
+            self.send_msg(0, None, None);
             self.last_send = now;
             self.ack_pending = false;
         }
+        self.send_history(now, rto);
         false
+    }
+
+    fn hist_pending(&self) -> bool {
+        let hooks = self.parser.callbacks();
+        self.instance.is_some() && self.hist_sent < hooks.dropped + hooks.lines.len() as u64
+    }
+
+    /// Stream scrolled-off rows to the client (go-back-N on loss). If the
+    /// client falls far behind (an output flood), skip ahead: the full
+    /// history stays available in the viewer.
+    fn send_history(&mut self, now: Instant, rto: Duration) {
+        if self.instance.is_none() || self.peers.is_empty() {
+            return;
+        }
+        let hooks = self.parser.callbacks();
+        let (dropped, end) = (hooks.dropped, hooks.dropped + hooks.lines.len() as u64);
+        if self.hist_sent > self.hist_have && now.duration_since(self.hist_anchor) > rto {
+            self.hist_sent = self.hist_have;
+            self.hist_anchor = now;
+        }
+        if end.saturating_sub(self.hist_have) > HIST_SKIP_AT || self.hist_have < dropped {
+            self.hist_floor = end.saturating_sub(HIST_SKIP_TO).max(dropped);
+            self.hist_have = self.hist_have.max(self.hist_floor);
+            self.hist_sent = self.hist_sent.max(self.hist_have);
+            self.hist_anchor = now;
+        }
+        let mut packets = 0;
+        while self.hist_sent < end && self.hist_sent - self.hist_have < HIST_WINDOW && packets < 16 {
+            let hooks = self.parser.callbacks();
+            let first = (self.hist_sent - dropped) as usize;
+            let mut n = 0;
+            let mut raw = 0;
+            while first + n < hooks.lines.len() && n < 200 && raw < 4000 {
+                raw += hooks.lines[first + n].fmt.len() + 1;
+                n += 1;
+            }
+            let data = loop {
+                let text: Vec<&str> = hooks.lines.range(first..first + n).map(|l| l.fmt.as_str()).collect();
+                let data = proto::deflate(text.join("\n").as_bytes());
+                if data.len() <= MAX_FRAG || n == 1 {
+                    break data;
+                }
+                n = n.div_ceil(2);
+            };
+            let start = self.hist_sent;
+            // Only the chunk at a deliberate jump (the initial seed or a flood
+            // skip) may be taken by a client that is behind it.
+            let skip = start == self.hist_floor && start > self.hist_reported;
+            let hist = Hist { start, skip, data };
+            self.send_msg(0, None, Some(hist));
+            self.hist_sent += n as u64;
+            packets += 1;
+        }
     }
 }

@@ -5,7 +5,7 @@
 //! version the client currently shows. Server → client carries fragments of
 //! "turn screen version `base` into version `new`" diffs.
 
-pub const PROTO: u8 = 1;
+pub const PROTO: u8 = 2;
 /// Max diff bytes per server packet (keeps datagrams under typical MTU).
 pub const MAX_FRAG: usize = 1100;
 /// Max keystroke bytes per client packet.
@@ -26,6 +26,8 @@ pub struct ClientMsg {
     pub input: Vec<u8>,
     pub cols: u16,
     pub rows: u16,
+    /// History lines received so far (absolute index, exclusive).
+    pub hist_have: u64,
 }
 
 pub struct Frame {
@@ -33,6 +35,18 @@ pub struct Frame {
     pub new: u64,
     pub idx: u16,
     pub count: u16,
+    /// Screen size of version `new`.
+    pub rows: u16,
+    pub cols: u16,
+    pub data: Vec<u8>,
+}
+
+/// Rows that scrolled off the top of the server's screen, for the client's
+/// native scrollback: deflated, `\n`-separated, starting at line `start`.
+pub struct Hist {
+    pub start: u64,
+    /// Lines before `start` were skipped (output flood).
+    pub skip: bool,
     pub data: Vec<u8>,
 }
 
@@ -40,6 +54,7 @@ pub struct ServerMsg {
     pub flags: u8,
     pub input_ack: u64,
     pub frame: Option<Frame>,
+    pub hist: Option<Hist>,
 }
 
 impl ClientMsg {
@@ -53,6 +68,7 @@ impl ClientMsg {
         w.bytes(&self.input);
         w.u16(self.cols);
         w.u16(self.rows);
+        w.u64(self.hist_have);
         w.0
     }
 
@@ -69,6 +85,7 @@ impl ClientMsg {
             input: r.bytes()?.to_vec(),
             cols: r.u16()?,
             rows: r.u16()?,
+            hist_have: r.u64()?,
         })
     }
 }
@@ -87,7 +104,18 @@ impl ServerMsg {
                 w.u64(f.new);
                 w.u16(f.idx);
                 w.u16(f.count);
+                w.u16(f.rows);
+                w.u16(f.cols);
                 w.bytes(&f.data);
+            }
+        }
+        match &self.hist {
+            None => w.u8(0),
+            Some(h) => {
+                w.u8(1);
+                w.u64(h.start);
+                w.u8(h.skip as u8);
+                w.bytes(&h.data);
             }
         }
         w.0
@@ -107,10 +135,16 @@ impl ServerMsg {
                 new: r.u64()?,
                 idx: r.u16()?,
                 count: r.u16()?,
+                rows: r.u16()?,
+                cols: r.u16()?,
                 data: r.bytes()?.to_vec(),
             }),
         };
-        Some(ServerMsg { flags, input_ack, frame })
+        let hist = match r.u8()? {
+            0 => None,
+            _ => Some(Hist { start: r.u64()?, skip: r.u8()? != 0, data: r.bytes()?.to_vec() }),
+        };
+        Some(ServerMsg { flags, input_ack, frame, hist })
     }
 }
 
