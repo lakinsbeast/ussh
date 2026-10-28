@@ -7,8 +7,17 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-env-changed=USSH_EMBED_DIR");
     let mut code = String::from("pub static EMBEDDED: &[(&str, &[u8])] = &[\n");
+    // Our own platform is served from our own executable, never embedded.
+    let own = match (std::env::var("CARGO_CFG_TARGET_OS").as_deref(), std::env::var("CARGO_CFG_TARGET_ARCH").as_deref()) {
+        (Ok("linux"), Ok("x86_64")) => "Linux x86_64",
+        (Ok("linux"), Ok("aarch64")) => "Linux aarch64",
+        _ => "",
+    };
     if let Ok(dir) = std::env::var("USSH_EMBED_DIR") {
         for (platform, file) in [("Linux x86_64", "ussh-linux-x86_64"), ("Linux aarch64", "ussh-linux-aarch64")] {
+            if platform == own {
+                continue;
+            }
             let path = PathBuf::from(&dir).join(file);
             if let Ok(path) = path.canonicalize() {
                 println!("cargo:rerun-if-changed={}", path.display());
