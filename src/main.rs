@@ -5,6 +5,12 @@ mod proto;
 mod server;
 mod term;
 
+/// Server binaries for other platforms, embedded at build time from
+/// `$USSH_EMBED_DIR` (see build.rs).
+mod embedded {
+    include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
+}
+
 use std::sync::{Mutex, OnceLock};
 
 /// Debug log (client: USSH_LOG=path; server: if ~/.ussh/debug exists).
@@ -29,11 +35,16 @@ macro_rules! dlog {
 /// Identifies this exact binary, so the client can tell whether the copy
 /// installed on a server matches it.
 pub fn build_id() -> String {
-    use std::hash::Hasher;
-    let exe = std::env::current_exe().and_then(std::fs::read).unwrap_or_default();
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    h.write(&exe);
-    format!("{}-{:016x}", env!("CARGO_PKG_VERSION"), h.finish())
+    fnv_id(&std::env::current_exe().and_then(std::fs::read).unwrap_or_default())
+}
+
+/// FNV-1a: identical on every platform and toolchain, unlike std's hasher.
+pub fn fnv_id(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    format!("{}-{h:016x}", env!("CARGO_PKG_VERSION"))
 }
 
 fn main() {

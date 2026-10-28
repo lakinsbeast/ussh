@@ -6,12 +6,13 @@ use crate::crypto::{self, Keys, DIR_TO_CLIENT};
 use crate::proto::{self, ClientMsg, ServerMsg, ESC_BYTE, FLAG_ENDED, FLAG_SUPERSEDED, MAX_INPUT_CHUNK};
 use crate::server::valid_name;
 use crate::term;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "\
@@ -117,20 +118,45 @@ struct Boot {
     stdout: BufReader<ChildStdout>,
 }
 
+/// This binary's platform, spelled like `uname -sm`.
 fn local_platform() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => "Linux x86_64",
         ("linux", "aarch64") => "Linux aarch64",
+        ("macos", "x86_64") => "Darwin x86_64",
+        ("macos", "aarch64") => "Darwin arm64",
         _ => "unknown",
     }
 }
 
-/// Runs `ussh ARGS` on the host if the installed binary is this exact build;
-/// otherwise prints `USSH_NEED_INSTALL <uname -sm>`.
+/// The ussh binary to install on a host of `platform`: ourselves if the
+/// platform matches, else one embedded at build time.
+fn payload_for(platform: &str) -> Option<Cow<'static, [u8]>> {
+    if platform == local_platform() {
+        return std::env::current_exe().and_then(std::fs::read).ok().map(Cow::Owned);
+    }
+    crate::embedded::EMBEDDED.iter().find(|(p, _)| *p == platform).map(|(_, b)| Cow::Borrowed(*b))
+}
+
+/// (platform, build id) of every binary we can install.
+fn known_builds() -> &'static [(String, String)] {
+    static IDS: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    IDS.get_or_init(|| {
+        let mut v = vec![(local_platform().to_string(), crate::build_id())];
+        for (p, bytes) in crate::embedded::EMBEDDED {
+            v.push((p.to_string(), crate::fnv_id(bytes)));
+        }
+        v
+    })
+}
+
+/// Runs `ussh ARGS` on the host if the installed binary is the build we'd
+/// install there; otherwise prints `USSH_NEED_INSTALL <uname -sm>`.
 fn remote_cmd(args: &str) -> String {
-    let id = crate::build_id();
+    let cases: String = known_builds().iter().map(|(p, id)| format!("\"{p}\") E={id};; ")).collect();
     format!(
-        "sh -c 'B=\"$HOME/.local/bin/ussh\"; if [ -x \"$B\" ] && [ \"$(\"$B\" build-id 2>/dev/null)\" = \"{id}\" ]; \
+        "sh -c 'B=\"$HOME/.local/bin/ussh\"; case \"$(uname -sm)\" in {cases}*) E=none;; esac; \
+         if [ -x \"$B\" ] && [ \"$(\"$B\" build-id 2>/dev/null)\" = \"$E\" ]; \
          then exec \"$B\" {args}; fi; echo \"USSH_NEED_INSTALL $(uname -sm)\"'"
     )
 }
@@ -146,23 +172,29 @@ fn ssh_command(o: &Opts, batch: bool) -> Command {
 }
 
 fn install(o: &Opts, remote_platform: &str) -> Result<(), String> {
-    if remote_platform != local_platform() {
+    let Some(bin) = payload_for(remote_platform) else {
+        let have: Vec<&str> = known_builds().iter().map(|(p, _)| p.as_str()).collect();
         return Err(format!(
-            "{} is {remote_platform}, this ussh is built for {}; install a matching ussh at ~/.local/bin/ussh there",
+            "{} is {remote_platform}; this ussh can install: {}. Put a matching ussh at ~/.local/bin/ussh there",
             o.host,
-            local_platform()
+            have.join(", ")
         ));
-    }
-    eprintln!("ussh: installing ussh on {} (~/.local/bin/ussh)…", o.host);
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let file = std::fs::File::open(&exe).map_err(|e| e.to_string())?;
+    };
+    eprintln!("ussh: installing ussh on {} (~/.local/bin/ussh, {remote_platform})…", o.host);
     let script = "sh -c 'mkdir -p \"$HOME/.local/bin\" && cat > \"$HOME/.local/bin/.ussh.tmp\" && \
                   chmod 755 \"$HOME/.local/bin/.ussh.tmp\" && mv -f \"$HOME/.local/bin/.ussh.tmp\" \"$HOME/.local/bin/ussh\"'";
     let status = ssh_command(o, false)
         .arg(&o.host)
         .arg(script)
-        .stdin(file)
-        .status()
+        .stdin(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            let mut stdin = child.stdin.take().unwrap();
+            let written = stdin.write_all(&bin);
+            drop(stdin);
+            let status = child.wait()?;
+            written.map(|_| status)
+        })
         .map_err(|e| format!("ssh: {e}"))?;
     if !status.success() {
         return Err("installing ussh on the server failed".into());

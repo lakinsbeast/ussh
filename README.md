@@ -32,6 +32,10 @@ ussh --ssh="ssh -p 2222" host
 - **Сессии.** Привязаны к имени, а не к клиенту. Новый клиент забирает сессию, а старый получает «attached from another client».
 - **История.** Строки, ушедшие за верх экрана (включая вставленные через scroll region, как в инлайн-TUI), хранятся на сервере, до 50 000 штук. Вьюер рисуется на сервере и синхронизируется как обычный кадр.
 
+## Буфер обмена
+
+Копирование в удалённой программе через OSC 52 (vim с `+clipboard`/OSC52-плагином, tmux с `set-clipboard on`, многие TUI) попадает в буфер обмена локального терминала. Терминал должен поддерживать OSC 52: iTerm2 (включить «Applications in terminal may access clipboard»), Ghostty, kitty, WezTerm, Alacritty. Terminal.app — нет.
+
 ## Тестовые переключатели (клиент)
 
 `USSH_DROP=0.3` — терять 30% пакетов в обе стороны. `USSH_NO_UDP=1` — только через SSH. `USSH_ROAM_SECS=2` — менять UDP-сокет каждые 2 с. `USSH_BLACKHOLE=/path` — терять всё, пока файл существует.
@@ -39,5 +43,10 @@ ussh --ssh="ssh -p 2222" host
 ## Сборка
 
 ```
-cargo build --release --target x86_64-unknown-linux-musl
+./dist.sh          # dist/ussh-linux-x86_64, dist/ussh-linux-aarch64 (+ dist/ussh-macos)
+./setup-cross.sh   # один раз: zig + cargo-zigbuild, чтобы dist.sh собрал и macOS
 ```
+
+Клиент вшивает в себя серверные бинарники (`USSH_EMBED_DIR`, см. `build.rs`). Клиент под Mac сам ставит на сервер Linux-версию нужной архитектуры: выбор по `uname -sm`, а проверка по FNV-хешу бинарника (`ussh build-id`).
+
+Отладочный лог: клиент — `USSH_LOG=/path`, сервер — если существует `~/.ussh/debug`, пишет в `~/.ussh/run/NAME.debug`.

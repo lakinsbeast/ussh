@@ -21,11 +21,14 @@ pub struct Hooks {
     pub title: String,
     /// Bumped on every new history line, so the viewer knows to re-render.
     pub changes: u64,
+    /// The latest OSC 52 clipboard write, ready to forward, and its number.
+    pub clip: String,
+    pub clip_seq: u64,
 }
 
 impl Hooks {
     pub fn new() -> Self {
-        Hooks { lines: VecDeque::new(), dropped: 0, title: String::new(), changes: 0 }
+        Hooks { lines: VecDeque::new(), dropped: 0, title: String::new(), changes: 0, clip: String::new(), clip_seq: 0 }
     }
 }
 
@@ -43,6 +46,16 @@ impl vt100::Callbacks for Hooks {
         }
         self.lines.push_back(Line { fmt, plain });
         self.changes += 1;
+    }
+
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
+        let b64 = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=');
+        if data.len() > 1 << 20 || !data.iter().all(b64) || !ty.iter().all(u8::is_ascii_alphanumeric) {
+            return;
+        }
+        let ty = if ty.is_empty() { "c" } else { std::str::from_utf8(ty).unwrap() };
+        self.clip = format!("\x1b]52;{ty};{}\x07", std::str::from_utf8(data).unwrap());
+        self.clip_seq += 1;
     }
 
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {

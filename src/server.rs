@@ -215,6 +215,7 @@ struct GenKeys {
 struct Snap {
     screen: vt100::Screen,
     title: String,
+    clip_seq: u64,
 }
 
 struct Session {
@@ -247,6 +248,7 @@ struct Session {
     /// Frames sent back-to-back; a long streak means bulk output.
     frame_streak: u32,
     rto_anchor: Instant,
+    clip_acked: u64,
     srtt_ms: Option<f64>,
 
     input_expected: u64,
@@ -396,6 +398,7 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
         last_frame_at: now,
         frame_streak: 0,
         rto_anchor: now,
+        clip_acked: 0,
         srtt_ms: None,
         input_expected: 0,
         esc_pending: false,
@@ -450,7 +453,11 @@ impl Session {
         let now = Instant::now();
         match ev {
             Ev::Pty(data) => {
+                let clip_before = self.parser.callbacks().clip_seq;
                 self.parser.process(&data);
+                if self.parser.callbacks().clip_seq != clip_before {
+                    self.mark_dirty(now);
+                }
                 if let Some(v) = &mut self.viewer {
                     v.note_changes(self.parser.callbacks());
                     if v.stale {
@@ -576,6 +583,7 @@ impl Session {
             crate::dlog!("srv ack {} (sent {})", msg.ack, self.last_sent);
             self.acked = msg.ack;
             self.rto_anchor = now;
+            self.clip_acked = self.clip_acked.max(self.snaps[&msg.ack].clip_seq);
             let keep = self.snaps.split_off(&self.acked);
             self.snaps = keep;
             self.sent_at.retain(|v, _| *v >= msg.ack);
@@ -665,10 +673,11 @@ impl Session {
             }
             None => live.clone(),
         };
-        Snap { screen, title: self.parser.callbacks().title.clone() }
+        let hooks = self.parser.callbacks();
+        Snap { screen, title: hooks.title.clone(), clip_seq: hooks.clip_seq }
     }
 
-    fn payload(base: Option<&Snap>, new: &Snap) -> Vec<u8> {
+    fn payload(&self, base: Option<&Snap>, new: &Snap) -> Vec<u8> {
         let mut s = match base {
             // Full redraw: also switch off any input modes the client's
             // terminal may still have from an earlier state.
@@ -679,13 +688,17 @@ impl Session {
         if base.map_or(!new.title.is_empty(), |b| b.title != new.title) {
             s.push_str(&format!("\x1b]2;{}\x07", new.title));
         }
+        // Re-sent with every diff until a frame carrying it is acked.
+        if new.clip_seq > base.map_or(self.clip_acked, |b| b.clip_seq) {
+            s.push_str(&self.parser.callbacks().clip);
+        }
         proto::deflate(s.as_bytes())
     }
 
     /// Send the current screen as a new version, diffed against `base`.
     fn send_new_frame(&mut self, base: u64, now: Instant) {
         let snap = self.current_snap();
-        let payload = Self::payload(self.snaps.get(&base), &snap);
+        let payload = self.payload(self.snaps.get(&base), &snap);
         self.version += 1;
         let v = self.version;
         self.snaps.insert(v, snap);
@@ -764,7 +777,7 @@ impl Session {
             } else {
                 let base = self.acked;
                 let new = self.last_sent;
-                let payload = Self::payload(self.snaps.get(&base), &self.snaps[&new]);
+                let payload = self.payload(self.snaps.get(&base), &self.snaps[&new]);
                 self.transmit(base, new, &payload, now);
             }
         } else if self.dirty
