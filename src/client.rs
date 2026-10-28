@@ -44,7 +44,9 @@ const USAGE: &str = "\
 usage: ussh [options] [user@]host
 
 options:
-  -s, --session NAME   session to attach or create (default: main)
+  -s, --session NAME   attach this session (taking it over from another
+                       window) or create it. Default: the last main/main-N
+                       no window is using, or a new main-N
   --ssh CMD            ssh command to use, e.g. --ssh=\"ssh -p 2222\"
   -l, --list           list sessions on host
   --kill               end the session on host
@@ -60,12 +62,15 @@ keys (Ctrl-^ is Ctrl-6 / Ctrl-Shift-6 on most keyboards):
 struct Opts {
     host: String,
     session: String,
+    /// No -s: let the server pick a free session.
+    auto: bool,
     ssh: Vec<String>,
 }
 
 pub fn main(args: &[String]) -> i32 {
     let mut host = None;
     let mut session = "main".to_string();
+    let mut auto = true;
     let mut ssh = std::env::var("USSH_SSH").unwrap_or_else(|_| "ssh".into());
     let (mut list, mut kill) = (false, false);
     let mut it = args.iter();
@@ -75,7 +80,10 @@ pub fn main(args: &[String]) -> i32 {
                 print!("{USAGE}");
                 return 0;
             }
-            "-s" | "--session" => session = it.next().cloned().unwrap_or_default(),
+            "-s" | "--session" => {
+                session = it.next().cloned().unwrap_or_default();
+                auto = false;
+            }
             "--ssh" => ssh = it.next().cloned().unwrap_or_default(),
             "-l" | "--list" => list = true,
             "--kill" => kill = true,
@@ -100,7 +108,7 @@ pub fn main(args: &[String]) -> i32 {
         eprintln!("ussh: empty --ssh");
         return 2;
     }
-    let o = Opts { host, session, ssh };
+    let mut o = Opts { host, session, auto, ssh };
     if let Some(home) = std::env::var_os("HOME") {
         let _ = std::fs::create_dir_all(std::path::Path::new(&home).join(".ussh"));
     }
@@ -125,7 +133,11 @@ pub fn main(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let msg = match run(o, boot) {
+    // Reconnects must come back to this very session.
+    let picked = o.auto && boot.session != "main";
+    o.session = boot.session.clone();
+    o.auto = false;
+    let msg = match run(o, boot, picked) {
         Ok(m) => m,
         Err(e) => format!("error: {e}"),
     };
@@ -141,6 +153,8 @@ struct Boot {
     key: [u8; 32],
     mask: [u8; 12],
     server_ip: Option<IpAddr>,
+    /// The session we got (the server picks one for a plain `ussh host`).
+    session: String,
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -257,7 +271,8 @@ fn bootstrap(o: &Opts, cols: u16, rows: u16, batch: bool) -> Result<Boot, String
         .ok()
         .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_alphanumeric()))
         .unwrap_or_else(|| "-".into());
-    let args = format!("server connect {} {cols} {rows} {colorterm}", o.session);
+    let name = if o.auto { "@auto" } else { o.session.as_str() };
+    let args = format!("server connect {name} {cols} {rows} {colorterm}");
     for _ in 0..2 {
         let mut child = ssh_command(o, batch)
             .arg(&o.host)
@@ -280,7 +295,7 @@ fn bootstrap(o: &Opts, cols: u16, rows: u16, batch: bool) -> Result<Boot, String
             continue;
         }
         let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() != 6 || f[0] != "USSH1" {
+        if !(6..=7).contains(&f.len()) || f[0] != "USSH1" {
             let _ = child.kill();
             let status = child.wait().ok().and_then(|s| s.code());
             return Err(if line.is_empty() {
@@ -296,6 +311,7 @@ fn bootstrap(o: &Opts, cols: u16, rows: u16, batch: bool) -> Result<Boot, String
             key: crypto::unhex(f[3]).ok_or_else(bad)?,
             mask: crypto::unhex(f[4]).ok_or_else(bad)?,
             server_ip: f[5].parse().ok(),
+            session: f.get(6).map_or(o.session.clone(), |s| s.to_string()),
             stdin: child.stdin.take().unwrap(),
             child,
             stdout,
@@ -513,7 +529,7 @@ enum Exit {
     Superseded,
 }
 
-fn run(o: Opts, boot: Boot) -> Result<String, String> {
+fn run(o: Opts, boot: Boot, picked: bool) -> Result<String, String> {
     let resolved = resolve_host(&o);
     let (tx, rx) = mpsc::channel::<Ev>();
 
@@ -616,6 +632,10 @@ fn run(o: Opts, boot: Boot) -> Result<String, String> {
     c.adopt(boot);
     c.rebind_udp();
     c.send(Instant::now());
+    if picked {
+        let text = format!("ussh: session {} (main is open in another window; ussh --list shows all)", c.o.session);
+        c.status(&text, Duration::from_secs(4));
+    }
 
     let result = loop {
         match rx.recv_timeout(Duration::from_millis(20)) {
@@ -653,7 +673,7 @@ impl Client {
         let _ = self.out.flush();
         drop(raw);
         match exit {
-            Exit::Detach => format!("detached; `ussh {}` reattaches session {}", self.o.host, self.o.session),
+            Exit::Detach => format!("detached; `ussh -s {s} {h}` reattaches session {s}, or `ussh {h}` the last free one", s = self.o.session, h = self.o.host),
             Exit::Ended => "session ended".into(),
             Exit::Superseded => "session was attached from another client".into(),
         }

@@ -82,7 +82,44 @@ fn control(name: &str, cmd: &str) -> Result<String, String> {
 
 // ---------------------------------------------------------------- connect
 
+/// The session a plain `ussh host` gets: the most recently used `main` /
+/// `main-N` that no live client holds, or else a new one. Runs under a lock
+/// so that windows opened together don't pick the same session; the lock is
+/// held until the CONNECT, which marks the session taken.
+fn pick_session() -> Result<(String, std::fs::File), String> {
+    let lock = std::fs::File::create(run_dir()?.join(".pick.lock")).map_err(|e| e.to_string())?;
+    unsafe {
+        libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX);
+    }
+    let names: Vec<String> = std::fs::read_dir(run_dir()?)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.strip_suffix(".sock").map(str::to_string))
+        .filter(|n| n == "main" || n.strip_prefix("main-").is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())))
+        .collect();
+    let states: Vec<(String, String)> = names.iter().map(|n| (n.clone(), control(n, "STATE").unwrap_or_default())).collect();
+    let mut free: Vec<(u64, String)> = states
+        .iter()
+        .filter_map(|(n, r)| Some((r.strip_prefix("OK free ")?.parse().ok()?, n.clone())))
+        .collect();
+    free.sort();
+    if let Some((_, n)) = free.into_iter().next() {
+        return Ok((n, lock));
+    }
+    // A session on its way out frees its name (connect waits for it).
+    let taken = |n: &str| states.iter().any(|(x, r)| x == n && !r.starts_with("ERR ending"));
+    let name = if !taken("main") { "main".to_string() } else { (2..).map(|i| format!("main-{i}")).find(|n| !taken(n)).unwrap() };
+    Ok((name, lock))
+}
+
 fn connect(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<(), String> {
+    let (name, lock) = if name == "@auto" {
+        let (n, l) = pick_session()?;
+        (n, Some(l))
+    } else {
+        (name.to_string(), None)
+    };
+    let name = name.as_str();
     if !valid_name(name) {
         return Err(format!("bad session name {name:?}"));
     }
@@ -106,6 +143,7 @@ fn connect(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<(), St
         }
         std::thread::sleep(Duration::from_millis(50));
     };
+    drop(lock);
     let mut it = reply.split_whitespace();
     if it.next() != Some("OK") {
         return Err(format!("session refused: {reply}"));
@@ -121,7 +159,7 @@ fn connect(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<(), St
         .and_then(|s| s.split_whitespace().nth(2).map(str::to_string))
         .unwrap_or_else(|| "-".into());
     let mut out = io::stdout().lock();
-    writeln!(out, "USSH1 {port} {generation} {key} {mask} {ip}").map_err(|e| e.to_string())?;
+    writeln!(out, "USSH1 {port} {generation} {key} {mask} {ip} {name}").map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())?;
     drop(out);
     relay(port)
@@ -189,10 +227,32 @@ fn list() -> Result<(), String> {
         .flatten()
         .filter_map(|e| e.file_name().to_str()?.strip_suffix(".sock").map(str::to_string))
         .collect();
-    names.sort();
+    names.sort_by_key(|n| (n != "main", n.len(), n.clone()));
+    let ago = |ms: u64| match ms / 1000 {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86400),
+    };
     for n in names {
         match control(&n, "INFO") {
-            Ok(r) => println!("{n}\t{}", r.strip_prefix("OK ").unwrap_or(&r)),
+            Ok(r) => {
+                // INFO: OK COLSxROWS last-client AGE rtt RTT
+                let f: Vec<&str> = r.split_whitespace().collect();
+                let size = f.get(1).copied().unwrap_or("?");
+                let rtt = f.iter().position(|x| *x == "rtt").and_then(|i| f.get(i + 1)).copied().unwrap_or("-");
+                let state = match control(&n, "STATE").as_deref() {
+                    Ok("OK busy") => "attached".to_string(),
+                    Ok(s) if s.starts_with("ERR") => "ending".to_string(),
+                    Ok(s) => match s.strip_prefix("OK free ").and_then(|v| v.parse::<u64>().ok()) {
+                        Some(u64::MAX) | None => "free".to_string(),
+                        Some(ms) => format!("free {}", ago(ms)),
+                    },
+                    Err(_) => "?".to_string(),
+                };
+                let rtt = if state == "attached" { format!("rtt {rtt}") } else { String::new() };
+                println!("{n:<12} {state:<10} {size:<8} {rtt}");
+            }
             Err(_) => {
                 let _ = std::fs::remove_file(sock_path(&n)?);
                 let _ = std::fs::remove_dir_all(run_dir()?.join(format!("{n}.files")));
@@ -247,6 +307,7 @@ struct Session {
     instance: Option<u64>,
     epoch: u32,
     last_client_msg: Option<Instant>,
+    last_connect: Option<Instant>,
 
     version: u64,
     dirty: bool,
@@ -413,6 +474,7 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
         instance: None,
         epoch: 0,
         last_client_msg: None,
+        last_connect: None,
         version: 0,
         dirty: true,
         dirty_since: now,
@@ -541,7 +603,23 @@ impl Session {
                         let key: [u8; 32] = crypto::random_bytes();
                         self.gens.insert(self.cur_gen, GenKeys { keys: Keys::new(&key), seq: 0, max_rx_seq: 0 });
                         self.peers.clear();
+                        self.last_connect = Some(now);
                         format!("OK {} {} {} {}", self.port, self.cur_gen, crypto::hex(&key), crypto::hex(&self.mask))
+                    }
+                    // Held by a live client (it sends twice a second), or
+                    // free and since when.
+                    "STATE" => {
+                        let age = |t: Option<Instant>| t.map_or(u64::MAX, |t| now.duration_since(t).as_millis() as u64);
+                        let (msg, conn) = (age(self.last_client_msg), age(self.last_connect));
+                        if self.ended.is_some() {
+                            "ERR ending".to_string()
+                        } else if msg < 3000 || (conn < 10_000 && conn < msg) {
+                            // (A client that has connected but not yet
+                            // sent anything counts as there.)
+                            "OK busy".to_string()
+                        } else {
+                            format!("OK free {}", msg.min(conn))
+                        }
                     }
                     "INFO" => {
                         let idle = self.last_client_msg.map_or("never".to_string(), |t| format!("{}s", t.elapsed().as_secs()));
