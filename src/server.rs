@@ -194,6 +194,7 @@ fn list() -> Result<(), String> {
             Ok(r) => println!("{n}\t{}", r.strip_prefix("OK ").unwrap_or(&r)),
             Err(_) => {
                 let _ = std::fs::remove_file(sock_path(&n)?);
+                let _ = std::fs::remove_dir_all(run_dir()?.join(format!("{n}.files")));
             }
         }
     }
@@ -455,6 +456,8 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
         }
     }
     let _ = std::fs::remove_file(&path);
+    // Files pasted into this session live only as long as it does.
+    let _ = std::fs::remove_dir_all(run_dir()?.join(format!("{name}.files")));
     Ok(())
 }
 

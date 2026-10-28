@@ -279,6 +279,49 @@ fn bootstrap(o: &Opts, cols: u16, rows: u16, batch: bool) -> Result<Boot, String
     Err("install did not take effect".into())
 }
 
+/// Copies a local file into the session's paste directory on the server
+/// (over the shared SSH connection) and returns its remote path.
+fn upload(o: &Opts, local: &std::path::Path, name: &str, pid: &std::sync::atomic::AtomicU32) -> Result<String, String> {
+    let file = std::fs::File::open(local).map_err(|e| format!("{}: {e}", local.display()))?;
+    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    // Only a complete file gets its final name (a cancelled upload ends the
+    // stream early, which `cat` can't tell from a normal end).
+    let script = format!(
+        "sh -c 'd=\"$HOME/.ussh/run/{}.files\"; mkdir -p \"$d\" && chmod 700 \"$d\" && n=\"{name}\"; t=\"$d/$n\"; i=1; \
+         while [ -e \"$t\" ]; do t=\"$d/$i-$n\"; i=$((i+1)); done; cat > \"$t.part\"; \
+         if [ $(($(wc -c < \"$t.part\"))) -eq {size} ]; then mv \"$t.part\" \"$t\" && printf \"%s\\n\" \"$t\"; \
+         else rm -f \"$t.part\"; echo incomplete upload >&2; exit 1; fi'",
+        o.session
+    );
+    let out = ssh_command(o, true)
+        .arg(&o.host)
+        .arg(script)
+        .stdin(file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|child| {
+            pid.store(child.id(), Ordering::SeqCst);
+            child.wait_with_output()
+        })
+        .map_err(|e| format!("ssh: {e}"))?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || path.is_empty() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(err.lines().last().unwrap_or("ssh failed").to_string());
+    }
+    Ok(path)
+}
+
+fn human_size(n: u64) -> String {
+    match n {
+        n if n >= 1 << 30 => format!("{:.1} GB", n as f64 / (1u64 << 30) as f64),
+        n if n >= 1 << 20 => format!("{:.1} MB", n as f64 / (1u64 << 20) as f64),
+        n if n >= 1 << 10 => format!("{:.0} KB", n as f64 / 1024.0),
+        n => format!("{n} B"),
+    }
+}
+
 /// The address ssh actually dials (resolves ~/.ssh/config aliases).
 fn resolve_host(o: &Opts) -> Option<IpAddr> {
     let out = Command::new(&o.ssh[0]).args(&o.ssh[1..]).arg("-G").arg(&o.host).stderr(Stdio::null()).output().ok()?;
@@ -296,6 +339,8 @@ enum Ev {
     Net(Vec<u8>, bool),
     RelayDead(u64),
     Reconnected(Result<Box<Boot>, String>),
+    ClipChecked(Option<crate::clipboard::Clip>),
+    Uploaded(Result<Vec<String>, String>),
 }
 
 struct Relay {
@@ -395,6 +440,12 @@ struct Client {
     mirror: vt100::Parser,
     hist_have: u64,
     hist_pending: Vec<String>,
+    /// Ctrl+V pressed: keys typed until the clipboard is checked wait here.
+    paste_pending: bool,
+    held: Vec<u8>,
+    /// pid of the ssh doing an upload (0 = none), for Ctrl+C to cancel.
+    upload_pid: Arc<std::sync::atomic::AtomicU32>,
+    status_until: Option<Instant>,
 }
 
 enum Exit {
@@ -487,6 +538,10 @@ fn run(o: Opts, boot: Boot) -> Result<String, String> {
         mirror: vt100::Parser::new(crate::history::nz(rows0), crate::history::nz(cols0), 0),
         hist_have: 0,
         hist_pending: Vec::new(),
+        paste_pending: false,
+        held: Vec::new(),
+        upload_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        status_until: None,
     };
     let ip = resolved.or(boot.server_ip);
     c.server = ip.map(|ip| SocketAddr::new(ip, boot.port));
@@ -626,6 +681,42 @@ impl Client {
                     }
                 }
             }
+            Ev::ClipChecked(clip) => {
+                let uploading = match clip {
+                    None => {
+                        self.input.push(0x16);
+                        false
+                    }
+                    Some(clip) => self.start_upload(clip),
+                };
+                // Keys typed meanwhile wait until the paste lands, so they
+                // can't overtake it.
+                if !uploading {
+                    return self.release_held(now);
+                }
+            }
+            Ev::Uploaded(r) => match r {
+                Ok(paths) if !self.paste_pending => drop(paths),
+                Ok(paths) => {
+                    // Typed in as if dropped onto the terminal.
+                    let text = paths.join(" ");
+                    if self.mirror.screen().bracketed_paste() {
+                        self.input.extend_from_slice(b"\x1b[200~");
+                        self.input.extend_from_slice(text.as_bytes());
+                        self.input.extend_from_slice(b"\x1b[201~");
+                    } else {
+                        self.input.extend_from_slice(text.as_bytes());
+                    }
+                    self.status_until = None;
+                    self.redraw_local();
+                    return self.release_held(now);
+                }
+                Err(_) if !self.paste_pending => {}
+                Err(e) => {
+                    self.status(&format!("ussh: upload failed: {e}"), Duration::from_secs(4));
+                    return self.release_held(now);
+                }
+            },
             Ev::Reconnected(r) => {
                 self.reconnecting = false;
                 match r {
@@ -648,7 +739,39 @@ impl Client {
     }
 
     fn on_keys(&mut self, data: &[u8], now: Instant) -> Option<Exit> {
-        for &b in data {
+        for (i, &b) in data.iter().enumerate() {
+            if self.paste_pending {
+                let pid = self.upload_pid.load(Ordering::SeqCst);
+                if b == 0x03 && pid != 0 {
+                    // Ctrl+C cancels the upload.
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGTERM);
+                    }
+                    self.upload_pid.store(0, Ordering::SeqCst);
+                    self.status("ussh: upload cancelled", Duration::from_secs(2));
+                    self.paste_pending = false;
+                    let mut rest = std::mem::take(&mut self.held);
+                    rest.extend_from_slice(&data[i + 1..]);
+                    return self.on_keys(&rest, now);
+                }
+                self.held.push(b);
+                continue;
+            }
+            if b == 0x16 && !self.prefix {
+                // Ctrl+V: upload copied files/images; plain text passes through.
+                self.paste_pending = true;
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(Ev::ClipChecked(crate::clipboard::read()));
+                });
+                continue;
+            }
+            if self.prefix && b == 0x16 {
+                // Ctrl-^ Ctrl-V: a literal Ctrl+V.
+                self.prefix = false;
+                self.input.push(0x16);
+                continue;
+            }
             if self.prefix {
                 self.prefix = false;
                 match b {
@@ -771,6 +894,71 @@ impl Client {
         None
     }
 
+    fn release_held(&mut self, now: Instant) -> Option<Exit> {
+        self.paste_pending = false;
+        let held = std::mem::take(&mut self.held);
+        let exit = self.on_keys(&held, now);
+        self.send(now);
+        exit
+    }
+
+    /// Returns whether an upload was started.
+    fn start_upload(&mut self, clip: crate::clipboard::Clip) -> bool {
+        use crate::clipboard::{safe_name, Clip};
+        let (files, temp) = match clip {
+            Clip::Files(f) => (f, None),
+            Clip::Image(p) => {
+                let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                (vec![p.clone()], Some((p, format!("paste-{secs}.png"))))
+            }
+        };
+        let files: Vec<std::path::PathBuf> = files.into_iter().filter(|f| f.is_file()).collect();
+        if files.is_empty() {
+            self.status("ussh: nothing to upload (folders aren't supported yet)", Duration::from_secs(3));
+            return false;
+        }
+        let size: u64 = files.iter().filter_map(|f| f.metadata().ok()).map(|m| m.len()).sum();
+        let what = if files.len() == 1 {
+            temp.as_ref().map(|t| t.1.clone()).unwrap_or_else(|| files[0].file_name().unwrap_or_default().to_string_lossy().into_owned())
+        } else {
+            format!("{} files", files.len())
+        };
+        self.status(&format!("ussh: uploading {what} ({})… Ctrl+C cancels", human_size(size)), Duration::from_secs(3600));
+        let (o, tx, pid) = (self.o.clone(), self.tx.clone(), self.upload_pid.clone());
+        std::thread::spawn(move || {
+            let mut paths = Vec::new();
+            let mut result = Ok(());
+            for f in &files {
+                let name = match &temp {
+                    Some((_, n)) => n.clone(),
+                    None => safe_name(&f.file_name().unwrap_or_default().to_string_lossy()),
+                };
+                match upload(&o, f, &name, &pid) {
+                    Ok(p) => paths.push(p),
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
+            }
+            if let Some((p, _)) = &temp {
+                let _ = std::fs::remove_file(p);
+            }
+            pid.store(0, Ordering::SeqCst);
+            let _ = tx.send(Ev::Uploaded(result.map(|_| paths)));
+        });
+        true
+    }
+
+    /// A one-line notice on the top row until `for` elapses or it's replaced.
+    fn status(&mut self, text: &str, dur: Duration) {
+        let text: String = format!(" {text}").chars().take(self.cols as usize).collect();
+        let pad = (self.cols as usize).saturating_sub(text.chars().count());
+        let _ = write!(self.out, "\x1b7\x1b[1;1H\x1b[0;30;46m{text}{}\x1b[0m\x1b8", " ".repeat(pad));
+        let _ = self.out.flush();
+        self.status_until = Some(Instant::now() + dur);
+    }
+
     /// Repaint the terminal from the mirror.
     fn redraw_local(&mut self) {
         let s = self.mirror.screen().contents_formatted();
@@ -856,6 +1044,10 @@ impl Client {
         let now = Instant::now();
         if self.overlay_drawn.is_none() {
             self.flush_history();
+        }
+        if self.status_until.is_some_and(|t| now >= t) {
+            self.status_until = None;
+            self.redraw_local();
         }
         if let Some(every) = self.knobs.roam {
             if now.duration_since(self.last_roam) >= every {

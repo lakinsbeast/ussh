@@ -1,4 +1,5 @@
 mod client;
+mod clipboard;
 mod crypto;
 mod history;
 mod proto;
