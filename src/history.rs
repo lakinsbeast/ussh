@@ -36,6 +36,9 @@ pub struct Hooks {
     pub event_seq: u64,
     /// The current OSC 9;4 progress report (empty: none).
     pub progress: String,
+    /// Kitty keyboard protocol flags, a stack per screen (main, alternate)
+    /// over a base entry that is never popped.
+    pub kbd: [Vec<u16>; 2],
 }
 
 const MAX_EVENTS: usize = 16;
@@ -48,11 +51,16 @@ impl Hooks {
             self.events.pop_front();
         }
     }
+
+    /// The keyboard flags the program asked for on this screen.
+    pub fn kbd_flags(&self, alt: bool) -> u16 {
+        *self.kbd[alt as usize].last().unwrap()
+    }
 }
 
 impl Hooks {
     pub fn new() -> Self {
-        Hooks { lines: VecDeque::new(), dropped: 0, title: String::new(), changes: 0, clip: String::new(), clip_seq: 0, replies: Vec::new(), px: (0, 0), term: String::new(), events: VecDeque::new(), event_seq: 0, progress: String::new() }
+        Hooks { lines: VecDeque::new(), dropped: 0, title: String::new(), changes: 0, clip: String::new(), clip_seq: 0, replies: Vec::new(), px: (0, 0), term: String::new(), events: VecDeque::new(), event_seq: 0, progress: String::new(), kbd: [vec![0], vec![0]] }
     }
 }
 
@@ -87,6 +95,42 @@ impl vt100::Callbacks for Hooks {
         let (rows, cols) = screen.size();
         let (rows, cols) = (rows.get(), cols.get());
         let (w, h) = self.px;
+        // The kitty keyboard protocol, if the client's terminal has it
+        // (we only know the name of those that do).
+        if c == 'u' && !self.term.is_empty() {
+            let stack = &mut self.kbd[screen.alternate_screen() as usize];
+            match i1 {
+                Some(b'?') => {
+                    let flags = stack.last().unwrap();
+                    self.replies.extend_from_slice(format!("\x1b[?{flags}u").as_bytes());
+                }
+                Some(b'>') => {
+                    if stack.len() > 16 {
+                        stack.remove(1);
+                    }
+                    stack.push(p0 & 31);
+                }
+                Some(b'<') => {
+                    for _ in 0..p0.max(1) {
+                        if stack.len() > 1 {
+                            stack.pop();
+                        } else {
+                            stack[0] = 0;
+                        }
+                    }
+                }
+                Some(b'=') => {
+                    let top = stack.last_mut().unwrap();
+                    match params.get(1).and_then(|p| p.first()).copied().unwrap_or(1) {
+                        2 => *top |= p0 & 31,
+                        3 => *top &= !p0,
+                        _ => *top = p0 & 31,
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         let r = match (i1, c, p0) {
             // Primary device attributes: a VT220 with colour, like mosh.
             (None, 'c', 0) => "\x1b[?62;22c".to_string(),

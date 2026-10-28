@@ -227,6 +227,8 @@ struct Snap {
     clip_seq: u64,
     event_seq: u64,
     progress: String,
+    /// Kitty keyboard flags for the client's terminal.
+    kbd: u16,
 }
 
 struct Session {
@@ -770,7 +772,9 @@ impl Session {
             None => live.clone(),
         };
         let hooks = self.parser.callbacks();
-        Snap { screen, title: hooks.title.clone(), clip_seq: hooks.clip_seq, event_seq: hooks.event_seq, progress: hooks.progress.clone() }
+        // The viewer reads plain keys.
+        let kbd = if self.viewer.is_some() { 0 } else { hooks.kbd_flags(self.parser.screen().alternate_screen()) };
+        Snap { screen, title: hooks.title.clone(), clip_seq: hooks.clip_seq, event_seq: hooks.event_seq, progress: hooks.progress.clone(), kbd }
     }
 
     fn payload(&self, base: Option<&Snap>, new: &Snap) -> Vec<u8> {
@@ -787,6 +791,9 @@ impl Session {
         // Re-sent with every diff until a frame carrying it is acked.
         if new.clip_seq > base.map_or(self.clip_acked, |b| b.clip_seq) {
             s.push_str(&self.parser.callbacks().clip);
+        }
+        if !self.parser.callbacks().term.is_empty() && base.is_none_or(|b| b.kbd != new.kbd) {
+            s.push_str(&format!("\x1b[={};1u", new.kbd));
         }
         // Bells and notifications the client hasn't had, once each.
         let since = base.map_or(self.event_acked, |b| b.event_seq);

@@ -19,6 +19,23 @@ const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 const PASTE_MAX: usize = 64 * 1024;
 
+/// A kitty keyboard protocol key report at the start of `b`: (length, key
+/// code, modifier bits, event type).
+fn csi_u(b: &[u8]) -> Option<(usize, u32, u32, u32)> {
+    let body = b.strip_prefix(b"\x1b[")?;
+    let end = body.iter().position(|&c| !(c.is_ascii_digit() || c == b';' || c == b':'))?;
+    if body[end] != b'u' || end == 0 {
+        return None;
+    }
+    let params = std::str::from_utf8(&body[..end]).ok()?;
+    let mut fields = params.split(';');
+    let code = fields.next()?.split(':').next()?.parse().ok()?;
+    let mut m = fields.next().unwrap_or("1").split(':');
+    let mods: u32 = m.next().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let event = m.next().and_then(|v| v.parse().ok()).unwrap_or(1);
+    Some((end + 3, code, mods.saturating_sub(1), event))
+}
+
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
@@ -625,6 +642,10 @@ fn run(o: Opts, boot: Boot) -> Result<String, String> {
 impl Client {
     fn finish(mut self, raw: term::RawMode, exit: Exit) -> String {
         self.relay = None;
+        if !self.term_name.is_empty() {
+            // Back to plain keys (the server may have turned on kitty's).
+            let _ = self.out.write_all(b"\x1b[=0;1u");
+        }
         let _ = self.out.write_all(
             b"\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1l\x1b>\x1b[?25h\x1b[?2026l",
         );
@@ -862,7 +883,19 @@ impl Client {
     }
 
     fn keys_raw(&mut self, data: &[u8], now: Instant) -> Option<Exit> {
-        for (i, &b) in data.iter().enumerate() {
+        let mut i = 0;
+        while i < data.len() {
+            let (b, len) = match self.own_key(&data[i..]) {
+                Some((_, n, true)) => {
+                    // The release of one of our keys.
+                    i += n;
+                    continue;
+                }
+                Some((b, n, false)) => (b, n),
+                None => (data[i], 1),
+            };
+            let next = i + len;
+            i = next;
             if self.paste_pending {
                 let pid = self.upload_pid.load(Ordering::SeqCst);
                 if b == 0x03 && pid != 0 {
@@ -874,7 +907,7 @@ impl Client {
                     self.status("ussh: upload cancelled", Duration::from_secs(2));
                     self.paste_pending = false;
                     let mut rest = std::mem::take(&mut self.held);
-                    rest.extend_from_slice(&data[i + 1..]);
+                    rest.extend_from_slice(&data[next..]);
                     return self.on_keys(&rest, now);
                 }
                 self.held.push(b);
@@ -911,6 +944,25 @@ impl Client {
         }
         self.send(now);
         None
+    }
+
+    /// Under the kitty keyboard protocol our own keys (Ctrl-^ and what
+    /// follows it, Ctrl+V, Ctrl+C during an upload) arrive as `CSI … u`:
+    /// returns the legacy byte, the sequence length, and whether it's a
+    /// key release.
+    fn own_key(&self, b: &[u8]) -> Option<(u8, usize, bool)> {
+        let (n, code, mods, event) = csi_u(b)?;
+        let mods = mods & !(64 | 128); // caps and num lock
+        let ctrl = mods & !1 == 4;
+        let uploading = self.paste_pending && self.upload_pid.load(Ordering::SeqCst) != 0;
+        let byte = match code {
+            54 | 94 if ctrl => ESC_BYTE,
+            118 if mods == 4 => 0x16,
+            99 if mods == 4 && uploading => 0x03,
+            0x20..=0x7e if mods & !1 == 0 && self.prefix => code as u8,
+            _ => return None,
+        };
+        Some((byte, n, event == 3))
     }
 
     fn on_packet(&mut self, wire: &[u8], via_udp: bool, now: Instant) -> Option<Exit> {
