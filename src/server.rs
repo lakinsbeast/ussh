@@ -78,19 +78,25 @@ fn connect(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<(), St
     if !valid_name(name) {
         return Err(format!("bad session name {name:?}"));
     }
-    let reply = match control(name, "CONNECT") {
-        Ok(r) => r,
-        Err(_) => {
-            spawn_session(name, cols, rows, colorterm)?;
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                match control(name, "CONNECT") {
-                    Ok(r) => break r,
-                    Err(e) if Instant::now() > deadline => return Err(format!("session did not start: {e}")),
-                    Err(_) => std::thread::sleep(Duration::from_millis(50)),
-                }
+    // A session that is shutting down refuses CONNECT; wait for it to go
+    // away and start a fresh one.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut spawned = false;
+    let reply = loop {
+        match control(name, "CONNECT") {
+            Ok(r) if r.starts_with("ERR ending") => {}
+            Ok(r) => break r,
+            Err(e) if spawned && Instant::now() > deadline => return Err(format!("session did not start: {e}")),
+            Err(_) if !spawned && UnixStream::connect(sock_path(name)?).is_err() => {
+                spawn_session(name, cols, rows, colorterm)?;
+                spawned = true;
             }
+            Err(_) => {}
         }
+        if Instant::now() > deadline {
+            return Err("timed out waiting for the session".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
     };
     let mut it = reply.split_whitespace();
     if it.next() != Some("OK") {
@@ -237,6 +243,10 @@ struct Session {
     acked: u64,
     last_sent: u64,
     last_send: Instant,
+    last_frame_at: Instant,
+    /// Frames sent back-to-back; a long streak means bulk output.
+    frame_streak: u32,
+    rto_anchor: Instant,
     srtt_ms: Option<f64>,
 
     input_expected: u64,
@@ -250,6 +260,7 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
     let cols: u16 = cols.parse().unwrap_or(80).clamp(2, 1000);
     let rows: u16 = rows.parse().unwrap_or(24).clamp(2, 1000);
     let path = sock_path(name)?;
+    crate::log_to(Some(run_dir()?.join("../debug")).filter(|p| p.exists()).map(|_| run_dir().unwrap().join(format!("{name}.debug"))));
     if UnixStream::connect(&path).is_ok() {
         return Err(format!("session {name} already running"));
     }
@@ -276,7 +287,9 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
     let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
 
-    let (tx, rx) = mpsc::channel::<Ev>();
+    // Bounded: a program flooding output gets backpressure, like on a real
+    // terminal, instead of growing our queue.
+    let (tx, rx) = mpsc::sync_channel::<Ev>(256);
 
     // PTY output.
     {
@@ -380,6 +393,9 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
         acked: 0,
         last_sent: 0,
         last_send: now,
+        last_frame_at: now,
+        frame_streak: 0,
+        rto_anchor: now,
         srtt_ms: None,
         input_expected: 0,
         esc_pending: false,
@@ -390,6 +406,7 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
     eprintln!("ussh session {name}: udp port {port}, pid {}", std::process::id());
 
     loop {
+        let loop_start = Instant::now();
         let busy = s.dirty || s.last_sent > s.acked || s.ack_pending || s.ended.is_some();
         let timeout = if busy { Duration::from_millis(2) } else { Duration::from_millis(100) };
         match rx.recv_timeout(timeout) {
@@ -397,12 +414,20 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        // Drain whatever else is queued before deciding what to send.
-        while let Ok(ev) = rx.try_recv() {
-            s.handle(ev);
+        // Drain what is queued, but never so long that sending starves.
+        let budget = Instant::now() + Duration::from_millis(10);
+        while Instant::now() < budget {
+            match rx.try_recv() {
+                Ok(ev) => s.handle(ev),
+                Err(_) => break,
+            }
         }
         if s.tick() {
             break;
+        }
+        let took = loop_start.elapsed().saturating_sub(timeout);
+        if took > Duration::from_millis(40) {
+            crate::dlog!("srv slow loop {}ms", took.as_millis());
         }
     }
     let _ = std::fs::remove_file(&path);
@@ -444,6 +469,7 @@ impl Session {
             Ev::Udp(wire, from) => self.on_packet(&wire, from, now),
             Ev::Control(cmd, reply) => {
                 let r = match cmd.as_str() {
+                    "CONNECT" if self.ended.is_some() => "ERR ending".to_string(),
                     "CONNECT" => {
                         self.cur_gen += 1;
                         let key: [u8; 32] = crypto::random_bytes();
@@ -547,7 +573,9 @@ impl Session {
                 let sample = now.duration_since(*t).as_secs_f64() * 1000.0;
                 self.srtt_ms = Some(self.srtt_ms.map_or(sample, |s| s * 0.875 + sample * 0.125));
             }
+            crate::dlog!("srv ack {} (sent {})", msg.ack, self.last_sent);
             self.acked = msg.ack;
+            self.rto_anchor = now;
             let keep = self.snaps.split_off(&self.acked);
             self.snaps = keep;
             self.sent_at.retain(|v, _| *v >= msg.ack);
@@ -664,10 +692,13 @@ impl Session {
         self.sent_at.insert(v, now);
         self.last_sent = v;
         self.dirty = false;
+        self.frame_streak = if now.duration_since(self.last_frame_at) < Duration::from_millis(40) { self.frame_streak + 1 } else { 0 };
+        self.last_frame_at = now;
         self.transmit(base, v, &payload, now);
     }
 
     fn transmit(&mut self, base: u64, new: u64, payload: &[u8], now: Instant) {
+        crate::dlog!("srv frame {base}->{new} {}B streak {} inflight {}", payload.len(), self.frame_streak, self.snaps.range(self.acked + 1..).count());
         let count = payload.len().div_ceil(MAX_FRAG).max(1);
         for idx in 0..count {
             let chunk = &payload[(idx * MAX_FRAG).min(payload.len())..((idx + 1) * MAX_FRAG).min(payload.len())];
@@ -711,10 +742,21 @@ impl Session {
 
         let srtt = self.srtt_ms.unwrap_or(100.0);
         let rto = Duration::from_millis((srtt * 1.5 + 50.0).clamp(80.0, 1000.0) as u64);
-        let interval = Duration::from_millis((srtt / 2.0).clamp(8.0, 100.0) as u64);
+        // Interactive changes go out almost immediately; sustained output is
+        // paced to ~2 frames per RTT so it can't flood a slow link.
+        let interval = if self.frame_streak >= 4 {
+            Duration::from_millis((srtt / 2.0).clamp(20.0, 100.0) as u64)
+        } else {
+            Duration::from_millis((srtt / 4.0).clamp(3.0, 50.0) as u64)
+        };
         let since_send = now.duration_since(self.last_send);
 
-        if self.last_sent > self.acked && since_send > rto {
+        // The timeout runs from the last ack progress (or retransmit), not the
+        // last send: during a stream of frames, a lost one must still be
+        // noticed quickly.
+        if self.last_sent > self.acked && now.duration_since(self.rto_anchor) > rto {
+            self.rto_anchor = now;
+            crate::dlog!("srv rto acked {} sent {}", self.acked, self.last_sent);
             // Assume what we sent since the last ack was lost: diff from the
             // acknowledged state again.
             if self.dirty {
@@ -734,8 +776,12 @@ impl Session {
             // Diff from the newest state we've sent: in-order delivery is the
             // common case, and a loss is caught by the timeout above.
             let base = if self.last_sent > self.acked { self.last_sent } else { self.acked };
+            if base == self.acked {
+                self.rto_anchor = now;
+            }
             self.send_new_frame(base, now);
-        } else if self.ack_pending || since_send >= Duration::from_secs(1) {
+        } else if self.ack_pending || since_send >= Duration::from_millis(500) {
+            crate::dlog!("srv heartbeat");
             self.send_msg(0, None);
             self.last_send = now;
             self.ack_pending = false;

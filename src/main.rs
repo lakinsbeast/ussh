@@ -5,6 +5,27 @@ mod proto;
 mod server;
 mod term;
 
+use std::sync::{Mutex, OnceLock};
+
+/// Debug log (client: USSH_LOG=path; server: if ~/.ussh/debug exists).
+pub static LOG: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+
+pub fn log_to(path: Option<std::path::PathBuf>) {
+    let f = path.and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
+    let _ = LOG.set(f.map(Mutex::new));
+}
+
+#[macro_export]
+macro_rules! dlog {
+    ($($t:tt)*) => {
+        if let Some(Some(f)) = $crate::LOG.get() {
+            use std::io::Write as _;
+            let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100_000_000;
+            let _ = writeln!(f.lock().unwrap(), "{ms} {}", format!($($t)*));
+        }
+    };
+}
+
 /// Identifies this exact binary, so the client can tell whether the copy
 /// installed on a server matches it.
 pub fn build_id() -> String {

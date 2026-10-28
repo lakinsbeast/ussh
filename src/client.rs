@@ -88,6 +88,7 @@ pub fn main(args: &[String]) -> i32 {
     }
 
     let (cols, rows) = term::size();
+    crate::log_to(std::env::var_os("USSH_LOG").map(Into::into));
     let boot = match bootstrap(&o, cols, rows, false) {
         Ok(b) => b,
         Err(e) => {
@@ -455,7 +456,9 @@ fn run(o: Opts, boot: Boot) -> Result<String, String> {
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break Exit::Detach,
         }
-        while let Ok(ev) = rx.try_recv() {
+        let budget = Instant::now() + Duration::from_millis(10);
+        while Instant::now() < budget {
+            let Ok(ev) = rx.try_recv() else { break };
             if let Some(exit) = c.handle(ev) {
                 return Ok(c.finish(raw, exit));
             }
@@ -625,6 +628,11 @@ impl Client {
         }
         let plain = self.keys.open(&hdr, wire)?;
         let msg = ServerMsg::decode(&plain)?;
+        if let Some(f) = &msg.frame {
+            crate::dlog!("cli recv {}->{} {}/{} have {}", f.base, f.new, f.idx, f.count, self.version);
+        } else {
+            crate::dlog!("cli recv hb flags {}", msg.flags);
+        }
 
         self.last_recv = now;
         if via_udp {
@@ -653,12 +661,14 @@ impl Client {
         }
         if let Some(f) = msg.frame {
             if f.new > self.version && f.count > 0 && f.idx < f.count {
-                let a = self.frags.entry(f.new).or_insert_with(|| Assembly {
-                    base: f.base,
-                    parts: vec![None; f.count as usize],
-                    got: 0,
-                });
-                if a.base == f.base && a.parts.len() == f.count as usize && a.parts[f.idx as usize].is_none() {
+                // A retransmission of the same version may be diffed from a
+                // different base: start that assembly over.
+                let fresh = || Assembly { base: f.base, parts: vec![None; f.count as usize], got: 0 };
+                let a = self.frags.entry(f.new).or_insert_with(fresh);
+                if a.base != f.base || a.parts.len() != f.count as usize {
+                    *a = fresh();
+                }
+                if a.parts[f.idx as usize].is_none() {
                     a.parts[f.idx as usize] = Some(f.data);
                     a.got += 1;
                 }
@@ -668,6 +678,7 @@ impl Client {
                     if let Some(bytes) = proto::inflate(&data) {
                         let _ = self.out.write_all(&bytes);
                         let _ = self.out.flush();
+                        crate::dlog!("cli apply {}->{}", a.base, f.new);
                         self.version = f.new;
                         let v = self.version;
                         self.frags.retain(|k, _| *k > v);
@@ -761,7 +772,7 @@ impl Client {
             });
         }
 
-        if silent > Duration::from_secs(2) && self.overlay_drawn.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
+        if silent > Duration::from_millis(2500) && self.overlay_drawn.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
             let mut text = format!(" ussh: no contact with {} for {}s", self.o.host, silent.as_secs());
             if self.reconnecting {
                 text.push_str(", reconnecting…");
