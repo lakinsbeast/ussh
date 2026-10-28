@@ -24,11 +24,15 @@ pub struct Hooks {
     /// The latest OSC 52 clipboard write, ready to forward, and its number.
     pub clip: String,
     pub clip_seq: u64,
+    /// Answers to terminal queries, for the program's input.
+    pub replies: Vec<u8>,
+    /// Terminal size in pixels (0 = unknown), for size queries.
+    pub px: (u16, u16),
 }
 
 impl Hooks {
     pub fn new() -> Self {
-        Hooks { lines: VecDeque::new(), dropped: 0, title: String::new(), changes: 0, clip: String::new(), clip_seq: 0 }
+        Hooks { lines: VecDeque::new(), dropped: 0, title: String::new(), changes: 0, clip: String::new(), clip_seq: 0, replies: Vec::new(), px: (0, 0) }
     }
 }
 
@@ -56,6 +60,22 @@ impl vt100::Callbacks for Hooks {
         let ty = if ty.is_empty() { "c" } else { std::str::from_utf8(ty).unwrap() };
         self.clip = format!("\x1b]52;{ty};{}\x07", std::str::from_utf8(data).unwrap());
         self.clip_seq += 1;
+    }
+
+    fn unhandled_csi(&mut self, screen: &mut vt100::Screen, i1: Option<u8>, _: Option<u8>, params: &[&[u16]], c: char) {
+        let p0 = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+        let (rows, cols) = screen.size();
+        let (rows, cols) = (rows.get(), cols.get());
+        let (w, h) = self.px;
+        let r = match (i1, c, p0) {
+            // Primary device attributes: a VT220 with colour, like mosh.
+            (None, 'c', 0) => "\x1b[?62;22c".to_string(),
+            (None, 't', 14) if w > 0 && h > 0 => format!("\x1b[4;{h};{w}t"),
+            (None, 't', 16) if w > 0 && h > 0 => format!("\x1b[6;{};{}t", h / rows, w / cols),
+            (None, 't', 18) => format!("\x1b[8;{rows};{cols}t"),
+            _ => return,
+        };
+        self.replies.extend_from_slice(r.as_bytes());
     }
 
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {

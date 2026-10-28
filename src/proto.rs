@@ -5,7 +5,7 @@
 //! version the client currently shows. Server → client carries fragments of
 //! "turn screen version `base` into version `new`" diffs.
 
-pub const PROTO: u8 = 2;
+pub const PROTO: u8 = 3;
 /// Max diff bytes per server packet (keeps datagrams under typical MTU).
 pub const MAX_FRAG: usize = 1100;
 /// Max keystroke bytes per client packet.
@@ -28,6 +28,13 @@ pub struct ClientMsg {
     pub rows: u16,
     /// History lines received so far (absolute index, exclusive).
     pub hist_have: u64,
+    /// The terminal draws kitty graphics (Unicode placeholders).
+    pub graphics: bool,
+    /// Terminal size in pixels (0 = unknown).
+    pub px_w: u16,
+    pub px_h: u16,
+    /// Graphics stream bytes received so far.
+    pub gfx_have: u64,
 }
 
 pub struct Frame {
@@ -50,11 +57,20 @@ pub struct Hist {
     pub data: Vec<u8>,
 }
 
+/// A piece of the graphics stream (see `graphics::Stream`).
+pub struct GfxChunk {
+    pub start: u64,
+    /// The stream restarts here: drop anything partial before it.
+    pub reset: bool,
+    pub data: Vec<u8>,
+}
+
 pub struct ServerMsg {
     pub flags: u8,
     pub input_ack: u64,
     pub frame: Option<Frame>,
     pub hist: Option<Hist>,
+    pub gfx: Option<GfxChunk>,
 }
 
 impl ClientMsg {
@@ -69,6 +85,10 @@ impl ClientMsg {
         w.u16(self.cols);
         w.u16(self.rows);
         w.u64(self.hist_have);
+        w.u8(self.graphics as u8);
+        w.u16(self.px_w);
+        w.u16(self.px_h);
+        w.u64(self.gfx_have);
         w.0
     }
 
@@ -86,6 +106,10 @@ impl ClientMsg {
             cols: r.u16()?,
             rows: r.u16()?,
             hist_have: r.u64()?,
+            graphics: r.u8()? != 0,
+            px_w: r.u16()?,
+            px_h: r.u16()?,
+            gfx_have: r.u64()?,
         })
     }
 }
@@ -118,6 +142,15 @@ impl ServerMsg {
                 w.bytes(&h.data);
             }
         }
+        match &self.gfx {
+            None => w.u8(0),
+            Some(g) => {
+                w.u8(1);
+                w.u64(g.start);
+                w.u8(g.reset as u8);
+                w.bytes(&g.data);
+            }
+        }
         w.0
     }
 
@@ -144,7 +177,11 @@ impl ServerMsg {
             0 => None,
             _ => Some(Hist { start: r.u64()?, skip: r.u8()? != 0, data: r.bytes()?.to_vec() }),
         };
-        Some(ServerMsg { flags, input_ack, frame, hist })
+        let gfx = match r.u8()? {
+            0 => None,
+            _ => Some(GfxChunk { start: r.u64()?, reset: r.u8()? != 0, data: r.bytes()?.to_vec() }),
+        };
+        Some(ServerMsg { flags, input_ack, frame, hist, gfx })
     }
 }
 

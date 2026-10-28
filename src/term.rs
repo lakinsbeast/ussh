@@ -43,3 +43,16 @@ pub fn size() -> (u16, u16) {
     }
     (80, 24)
 }
+
+/// (width, height) of the terminal in pixels, (0, 0) if it doesn't say.
+pub fn size_px() -> (u16, u16) {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        for fd in [1, 0, 2] {
+            if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+                return (ws.ws_xpixel, ws.ws_ypixel);
+            }
+        }
+    }
+    (0, 0)
+}

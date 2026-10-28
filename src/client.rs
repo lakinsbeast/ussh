@@ -468,6 +468,13 @@ struct Client {
     mirror: vt100::Parser,
     hist_have: u64,
     hist_pending: Vec<String>,
+    /// Kitty graphics: whether the terminal can, and the stream from the server.
+    graphics: bool,
+    px: (u16, u16),
+    gfx_have: u64,
+    /// Chunks that arrived ahead of a gap, by offset.
+    gfx_ahead: std::collections::BTreeMap<u64, Vec<u8>>,
+    sink: crate::graphics::Sink,
     /// Ctrl+V pressed: keys typed until the clipboard is checked wait here.
     paste_pending: bool,
     held: Vec<u8>,
@@ -571,6 +578,11 @@ fn run(o: Opts, boot: Boot) -> Result<String, String> {
         mirror: vt100::Parser::new(crate::history::nz(rows0), crate::history::nz(cols0), 0),
         hist_have: 0,
         hist_pending: Vec::new(),
+        graphics: crate::graphics::local_support(),
+        px: term::size_px(),
+        gfx_have: 0,
+        gfx_ahead: Default::default(),
+        sink: Default::default(),
         paste_pending: false,
         held: Vec::new(),
         upload_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -705,6 +717,7 @@ impl Client {
             Ev::StdinEof => return Some(Exit::Detach),
             Ev::Winch => {
                 (self.cols, self.rows) = term::size();
+                self.px = term::size_px();
                 self.send(now);
             }
             Ev::Net(wire, via_udp) => return self.on_packet(&wire, via_udp, now),
@@ -996,10 +1009,47 @@ impl Client {
             }
             reply = true;
         }
+        if let Some(g) = msg.gfx {
+            if g.reset && g.start > self.gfx_have {
+                self.sink.reset();
+                self.gfx_have = g.start;
+                self.gfx_ahead.retain(|off, _| *off > g.start);
+            }
+            if g.start > self.gfx_have {
+                if self.gfx_ahead.len() < 8192 {
+                    self.gfx_ahead.insert(g.start, g.data);
+                }
+            } else {
+                self.take_gfx(g.start, &g.data);
+                while let Some(e) = self.gfx_ahead.first_entry() {
+                    if *e.key() > self.gfx_have {
+                        break;
+                    }
+                    let (off, data) = e.remove_entry();
+                    self.take_gfx(off, &data);
+                }
+            }
+            reply = true;
+        }
         if reply {
             self.send(now);
         }
         None
+    }
+
+    /// Graphics stream bytes at `off` (which is at or before `gfx_have`).
+    fn take_gfx(&mut self, off: u64, data: &[u8]) {
+        let end = off + data.len() as u64;
+        if end <= self.gfx_have {
+            return;
+        }
+        let out = self.sink.feed(&data[(self.gfx_have - off) as usize..]);
+        self.gfx_have = end;
+        if !out.is_empty() && self.graphics {
+            crate::dlog!("cli gfx {} bytes to terminal, have {}", out.len(), end);
+            let _ = self.out.write_all(&out);
+            let _ = self.out.flush();
+        }
     }
 
     fn release_held(&mut self, now: Instant) -> Option<Exit> {
@@ -1171,6 +1221,10 @@ impl Client {
                     cols: self.cols,
                     rows: self.rows,
                     hist_have: self.hist_have,
+                    graphics: self.graphics,
+                    px_w: self.px.0,
+                    px_h: self.px.1,
+                    gfx_have: self.gfx_have,
                 }
                 .encode();
                 self.seq += 1;

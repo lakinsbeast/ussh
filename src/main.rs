@@ -1,6 +1,8 @@
 mod client;
 mod clipboard;
 mod crypto;
+mod diacritics;
+mod graphics;
 mod history;
 mod proto;
 mod server;

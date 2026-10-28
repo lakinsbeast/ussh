@@ -9,8 +9,9 @@
 //! * `ussh server list` / `ussh server kill NAME`.
 
 use crate::crypto::{self, Keys, DIR_TO_CLIENT};
+use crate::graphics::{Gfx, Piece, Splitter};
 use crate::history::{self, Hooks, KeyResult, Viewer};
-use crate::proto::{self, ClientMsg, Frame, Hist, ServerMsg, ESC_BYTE, FLAG_ENDED, FLAG_SUPERSEDED, MAX_FRAG};
+use crate::proto::{self, ClientMsg, Frame, GfxChunk, Hist, ServerMsg, ESC_BYTE, FLAG_ENDED, FLAG_SUPERSEDED, MAX_FRAG};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -266,6 +267,11 @@ struct Session {
     last_input_at: Option<Instant>,
     clip_acked: u64,
     srtt_ms: Option<f64>,
+    /// Kitty graphics: cut out of the output, stored, streamed to the client.
+    split: Splitter,
+    gfx: Gfx,
+    /// Client terminal size in pixels.
+    px: (u16, u16),
 
     input_expected: u64,
     esc_pending: bool,
@@ -422,6 +428,9 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
         last_input_at: None,
         clip_acked: 0,
         srtt_ms: None,
+        split: Splitter::default(),
+        gfx: Gfx::new(now),
+        px: (0, 0),
         input_expected: 0,
         esc_pending: false,
         ack_pending: false,
@@ -432,7 +441,7 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
 
     loop {
         let loop_start = Instant::now();
-        let busy = s.dirty || s.last_sent > s.acked || s.ack_pending || s.ended.is_some() || s.hist_pending();
+        let busy = s.dirty || s.last_sent > s.acked || s.ack_pending || s.ended.is_some() || s.hist_pending() || s.gfx_pending();
         let timeout = if busy { Duration::from_millis(1) } else { Duration::from_millis(100) };
         match rx.recv_timeout(timeout) {
             Ok(ev) => s.handle(ev),
@@ -478,7 +487,25 @@ impl Session {
         match ev {
             Ev::Pty(data) => {
                 let clip_before = self.parser.callbacks().clip_seq;
-                self.parser.process(&data);
+                for piece in self.split.feed(&data) {
+                    match piece {
+                        Piece::Text(t) => self.parser.process(&t),
+                        Piece::Graphics(cmd) => {
+                            let hooks = self.parser.callbacks();
+                            self.gfx.line = hooks.dropped + hooks.lines.len() as u64;
+                            let fx = self.gfx.command(&cmd, self.parser.screen());
+                            self.parser.process(fx.draw.as_bytes());
+                            if !fx.reply.is_empty() {
+                                let _ = self.pty_in.send(fx.reply);
+                            }
+                        }
+                    }
+                }
+                // Answers to terminal queries (device attributes, sizes).
+                let replies = std::mem::take(&mut self.parser.callbacks_mut().replies);
+                if !replies.is_empty() {
+                    let _ = self.pty_in.send(replies);
+                }
                 if self.parser.callbacks().clip_seq != clip_before {
                     self.mark_dirty(now);
                 }
@@ -560,7 +587,7 @@ impl Session {
         if hdr.generation != self.cur_gen {
             // An older client: tell it someone else took over.
             g.seq += 1;
-            let msg = ServerMsg { flags: FLAG_SUPERSEDED, input_ack: 0, frame: None, hist: None }.encode();
+            let msg = ServerMsg { flags: FLAG_SUPERSEDED, input_ack: 0, frame: None, hist: None, gfx: None }.encode();
             let out = g.keys.seal(&self.mask, hdr.generation, DIR_TO_CLIENT | g.seq, &msg);
             let _ = self.udp.send_to(&out, from);
             return;
@@ -599,14 +626,29 @@ impl Session {
             self.hist_sent = self.hist_floor;
             self.hist_reported = 0;
             self.hist_anchor = now;
+            // The new client's terminal has none of our images yet.
+            self.gfx.rebase(now, self.hist_floor);
+            self.gfx.stream.reported = 0;
         } else if msg.epoch > self.epoch {
             self.epoch = msg.epoch;
             self.reset_sync(now);
         }
 
+        if newest {
+            self.gfx.enabled = msg.graphics;
+            if (msg.px_w, msg.px_h) != self.px {
+                self.px = (msg.px_w, msg.px_h);
+                self.parser.callbacks_mut().px = self.px;
+                let _ = self.master.resize(PtySize { rows: self.rows, cols: self.cols, pixel_width: self.px.0, pixel_height: self.px.1 });
+            }
+        }
         if newest && msg.cols > 0 && msg.rows > 0 && (msg.cols, msg.rows) != (self.cols, self.rows) {
             self.resize(msg.cols.min(1000), msg.rows.min(1000), now);
         }
+        if self.px.0 > 0 && self.px.1 > 0 {
+            self.gfx.cell = (self.px.0 as u32 / self.cols.max(1) as u32, self.px.1 as u32 / self.rows.max(1) as u32);
+        }
+        self.gfx.stream.ack(msg.gfx_have, now);
 
         if msg.epoch == self.epoch && msg.ack > self.acked && self.snaps.contains_key(&msg.ack) {
             if let Some(t) = self.sent_at.get(&msg.ack) {
@@ -647,7 +689,7 @@ impl Session {
         self.cols = cols;
         self.rows = rows;
         self.parser.set_size(history::nz(rows), history::nz(cols));
-        let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+        let _ = self.master.resize(PtySize { rows, cols, pixel_width: self.px.0, pixel_height: self.px.1 });
         if let Some(v) = &mut self.viewer {
             v.stale = true;
         }
@@ -769,8 +811,12 @@ impl Session {
     }
 
     fn send_msg(&mut self, flags: u8, frame: Option<Frame>, hist: Option<Hist>) {
+        self.send_full(ServerMsg { flags, input_ack: self.input_expected, frame, hist, gfx: None });
+    }
+
+    fn send_full(&mut self, msg: ServerMsg) {
         let Some(g) = self.gens.get_mut(&self.cur_gen) else { return };
-        let msg = ServerMsg { flags, input_ack: self.input_expected, frame, hist }.encode();
+        let msg = msg.encode();
         g.seq += 1;
         let wire = g.keys.seal(&self.mask, self.cur_gen, DIR_TO_CLIENT | g.seq, &msg);
         for (addr, _) in &self.peers {
@@ -850,6 +896,7 @@ impl Session {
             self.ack_pending = false;
         }
         self.send_history(now, rto);
+        self.send_graphics(now, rto);
         false
     }
 
@@ -902,6 +949,46 @@ impl Session {
             let hist = Hist { start, skip, data };
             self.send_msg(0, None, Some(hist));
             self.hist_sent += n as u64;
+            packets += 1;
+        }
+    }
+
+    fn gfx_pending(&self) -> bool {
+        self.instance.is_some() && self.gfx.enabled && self.gfx.stream.sent < self.gfx.stream.end
+    }
+
+    /// Stream images to the client: go-back-N within a window that halves
+    /// on loss and grows with acks.
+    fn send_graphics(&mut self, now: Instant, rto: Duration) {
+        if self.instance.is_none() || self.peers.is_empty() || !self.gfx.enabled {
+            return;
+        }
+        let hooks = self.parser.callbacks();
+        let top = hooks.dropped + hooks.lines.len() as u64;
+        if self.gfx.backlogged(top) {
+            // Too far behind (e.g. a video): just send what's on screen.
+            self.gfx.rebase(now, top);
+        }
+        let st = &mut self.gfx.stream;
+        if st.sent > st.have && now.duration_since(st.anchor) > rto {
+            st.on_timeout(now);
+        } else if st.sent == st.have {
+            st.anchor = now;
+        }
+        let mut packets = 0;
+        while packets < 16 {
+            let st = &self.gfx.stream;
+            if st.sent >= st.end || st.sent - st.have >= st.window {
+                break;
+            }
+            let data = st.slice(st.sent, MAX_FRAG);
+            if data.is_empty() {
+                break;
+            }
+            let start = st.sent;
+            let reset = start == st.floor && start > st.reported;
+            self.gfx.stream.sent += data.len() as u64;
+            self.send_full(ServerMsg { flags: 0, input_ack: self.input_expected, frame: None, hist: None, gfx: Some(GfxChunk { start, reset, data }) });
             packets += 1;
         }
     }
