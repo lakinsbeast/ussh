@@ -248,6 +248,7 @@ struct Session {
     /// Frames sent back-to-back; a long streak means bulk output.
     frame_streak: u32,
     rto_anchor: Instant,
+    last_input_at: Option<Instant>,
     clip_acked: u64,
     srtt_ms: Option<f64>,
 
@@ -398,6 +399,7 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
         last_frame_at: now,
         frame_streak: 0,
         rto_anchor: now,
+        last_input_at: None,
         clip_acked: 0,
         srtt_ms: None,
         input_expected: 0,
@@ -411,7 +413,7 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
     loop {
         let loop_start = Instant::now();
         let busy = s.dirty || s.last_sent > s.acked || s.ack_pending || s.ended.is_some();
-        let timeout = if busy { Duration::from_millis(2) } else { Duration::from_millis(100) };
+        let timeout = if busy { Duration::from_millis(1) } else { Duration::from_millis(100) };
         match rx.recv_timeout(timeout) {
             Ok(ev) => s.handle(ev),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -486,7 +488,8 @@ impl Session {
                     }
                     "INFO" => {
                         let idle = self.last_client_msg.map_or("never".to_string(), |t| format!("{}s", t.elapsed().as_secs()));
-                        format!("OK {}x{} last-client {idle}", self.cols, self.rows)
+                        let rtt = self.srtt_ms.map_or("-".to_string(), |r| format!("{r:.0}ms"));
+                        format!("OK {}x{} last-client {idle} rtt {rtt}", self.cols, self.rows)
                     }
                     // Plain-text screen contents, hex-encoded (for tests).
                     "DUMP" => {
@@ -596,6 +599,7 @@ impl Session {
                 let fresh = msg.input[(self.input_expected - off) as usize..].to_vec();
                 self.input_expected = end;
                 self.feed_input(&fresh, now);
+                self.last_input_at = Some(now);
             }
             self.ack_pending = true;
         }
@@ -755,13 +759,18 @@ impl Session {
 
         let srtt = self.srtt_ms.unwrap_or(100.0);
         let rto = Duration::from_millis((srtt * 1.5 + 50.0).clamp(80.0, 1000.0) as u64);
-        // Interactive changes go out almost immediately; sustained output is
-        // paced to ~2 frames per RTT so it can't flood a slow link.
-        let interval = if self.frame_streak >= 4 {
-            Duration::from_millis((srtt / 2.0).clamp(20.0, 100.0) as u64)
+        // Right after a keystroke, the echo goes out at once. Sustained output
+        // with nobody typing is paced to ~2 frames per RTT so it can't flood a
+        // slow link.
+        let interactive = self.last_input_at.is_some_and(|t| now.duration_since(t) < Duration::from_millis(300));
+        let (interval, quiet) = if interactive {
+            (Duration::from_millis(1), Duration::from_millis(1))
+        } else if self.frame_streak >= 4 {
+            (Duration::from_millis((srtt / 2.0).clamp(20.0, 100.0) as u64), Duration::from_millis(3))
         } else {
-            Duration::from_millis((srtt / 4.0).clamp(3.0, 50.0) as u64)
+            (Duration::from_millis((srtt / 4.0).clamp(3.0, 50.0) as u64), Duration::from_millis(3))
         };
+        let since_frame = now.duration_since(self.last_frame_at);
         let since_send = now.duration_since(self.last_send);
 
         // The timeout runs from the last ack progress (or retransmit), not the
@@ -781,9 +790,8 @@ impl Session {
                 self.transmit(base, new, &payload, now);
             }
         } else if self.dirty
-            && since_send >= interval
-            && (now.duration_since(self.last_output) >= Duration::from_millis(3)
-                || now.duration_since(self.dirty_since) >= interval)
+            && since_frame >= interval
+            && (now.duration_since(self.last_output) >= quiet || now.duration_since(self.dirty_since) >= interval)
             && self.snaps.range(self.acked + 1..).count() < 32
         {
             // Diff from the newest state we've sent: in-order delivery is the

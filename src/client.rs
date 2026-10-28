@@ -76,6 +76,9 @@ pub fn main(args: &[String]) -> i32 {
         return 2;
     }
     let o = Opts { host, session, ssh };
+    if let Some(home) = std::env::var_os("HOME") {
+        let _ = std::fs::create_dir_all(std::path::Path::new(&home).join(".ussh"));
+    }
 
     if list || kill {
         let cmd = if list { "server list".to_string() } else { format!("server kill {}", o.session) };
@@ -165,6 +168,9 @@ fn ssh_command(o: &Opts, batch: bool) -> Command {
     let mut c = Command::new(&o.ssh[0]);
     c.args(&o.ssh[1..]).arg("-T");
     c.args(["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"]);
+    // One authenticated connection for install, connect and reconnects:
+    // a password is asked once, and later ssh runs start instantly.
+    c.args(["-o", "ControlMaster=auto", "-o", "ControlPath=%d/.ussh/cm-%C", "-o", "ControlPersist=600"]);
     if batch {
         c.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]);
     }
