@@ -1,0 +1,18 @@
+[package]
+name = "ussh"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chacha20poly1305 = "0.11.0"
+flate2 = "1.1.10"
+getrandom = "0.4.3"
+libc = "0.2.191"
+portable-pty = "0.9.0"
+signal-hook = "0.4.5"
+vt100 = "0.18.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
