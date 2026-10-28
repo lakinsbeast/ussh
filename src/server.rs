@@ -225,6 +225,8 @@ struct Snap {
     screen: vt100::Screen,
     title: String,
     clip_seq: u64,
+    event_seq: u64,
+    progress: String,
 }
 
 struct Session {
@@ -266,6 +268,7 @@ struct Session {
     hist_anchor: Instant,
     last_input_at: Option<Instant>,
     clip_acked: u64,
+    event_acked: u64,
     srtt_ms: Option<f64>,
     /// Kitty graphics: cut out of the output, stored, streamed to the client.
     split: Splitter,
@@ -427,6 +430,7 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
         hist_anchor: now,
         last_input_at: None,
         clip_acked: 0,
+        event_acked: 0,
         srtt_ms: None,
         split: Splitter::default(),
         gfx: Gfx::new(now),
@@ -486,7 +490,8 @@ impl Session {
         let now = Instant::now();
         match ev {
             Ev::Pty(data) => {
-                let clip_before = self.parser.callbacks().clip_seq;
+                let h = self.parser.callbacks();
+                let before = (h.clip_seq, h.event_seq, h.progress.clone());
                 for piece in self.split.feed(&data) {
                     match piece {
                         Piece::Text(t) => self.parser.process(&t),
@@ -506,7 +511,8 @@ impl Session {
                 if !replies.is_empty() {
                     let _ = self.pty_in.send(replies);
                 }
-                if self.parser.callbacks().clip_seq != clip_before {
+                let h = self.parser.callbacks();
+                if (h.clip_seq, h.event_seq, &h.progress) != (before.0, before.1, &before.2) {
                     self.mark_dirty(now);
                 }
                 if let Some(v) = &mut self.viewer {
@@ -662,6 +668,9 @@ impl Session {
             self.acked = msg.ack;
             self.rto_anchor = now;
             self.clip_acked = self.clip_acked.max(self.snaps[&msg.ack].clip_seq);
+            self.event_acked = self.event_acked.max(self.snaps[&msg.ack].event_seq);
+            let acked = self.event_acked;
+            self.parser.callbacks_mut().events.retain(|(seq, _)| *seq > acked);
             let keep = self.snaps.split_off(&self.acked);
             self.snaps = keep;
             self.sent_at.retain(|v, _| *v >= msg.ack);
@@ -761,7 +770,7 @@ impl Session {
             None => live.clone(),
         };
         let hooks = self.parser.callbacks();
-        Snap { screen, title: hooks.title.clone(), clip_seq: hooks.clip_seq }
+        Snap { screen, title: hooks.title.clone(), clip_seq: hooks.clip_seq, event_seq: hooks.event_seq, progress: hooks.progress.clone() }
     }
 
     fn payload(&self, base: Option<&Snap>, new: &Snap) -> Vec<u8> {
@@ -778,6 +787,17 @@ impl Session {
         // Re-sent with every diff until a frame carrying it is acked.
         if new.clip_seq > base.map_or(self.clip_acked, |b| b.clip_seq) {
             s.push_str(&self.parser.callbacks().clip);
+        }
+        // Bells and notifications the client hasn't had, once each.
+        let since = base.map_or(self.event_acked, |b| b.event_seq);
+        for (_, e) in self.parser.callbacks().events.iter().filter(|(seq, _)| *seq > since && *seq <= new.event_seq) {
+            s.push_str(e);
+        }
+        match base {
+            Some(b) if b.progress == new.progress => {}
+            Some(_) if new.progress.is_empty() => s.push_str("\x1b]9;4;0\x07"),
+            None if new.progress.is_empty() => {}
+            _ => s.push_str(&new.progress),
         }
         proto::deflate(s.as_bytes())
     }

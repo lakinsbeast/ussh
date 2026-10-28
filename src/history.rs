@@ -30,11 +30,29 @@ pub struct Hooks {
     pub px: (u16, u16),
     /// The client terminal's name, for XTVERSION (empty: no answer).
     pub term: String,
+    /// Bells and desktop notifications for the client's terminal, numbered
+    /// so each is delivered once.
+    pub events: VecDeque<(u64, String)>,
+    pub event_seq: u64,
+    /// The current OSC 9;4 progress report (empty: none).
+    pub progress: String,
+}
+
+const MAX_EVENTS: usize = 16;
+
+impl Hooks {
+    fn event(&mut self, s: String) {
+        self.event_seq += 1;
+        self.events.push_back((self.event_seq, s));
+        if self.events.len() > MAX_EVENTS {
+            self.events.pop_front();
+        }
+    }
 }
 
 impl Hooks {
     pub fn new() -> Self {
-        Hooks { lines: VecDeque::new(), dropped: 0, title: String::new(), changes: 0, clip: String::new(), clip_seq: 0, replies: Vec::new(), px: (0, 0), term: String::new() }
+        Hooks { lines: VecDeque::new(), dropped: 0, title: String::new(), changes: 0, clip: String::new(), clip_seq: 0, replies: Vec::new(), px: (0, 0), term: String::new(), events: VecDeque::new(), event_seq: 0, progress: String::new() }
     }
 }
 
@@ -79,6 +97,30 @@ impl vt100::Callbacks for Hooks {
             _ => return,
         };
         self.replies.extend_from_slice(r.as_bytes());
+    }
+
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        // A burst of bells rings once.
+        if self.events.back().is_none_or(|(_, e)| e != "\x07") {
+            self.event("\x07".into());
+        }
+    }
+
+    /// Desktop notifications (OSC 9 iTerm2, 777 rxvt/Ghostty, 99 kitty) and
+    /// OSC 9;4 progress pass through to the client's terminal.
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        let body = params.join(&b';');
+        if body.len() > 4096 || body.iter().any(|&b| b < 0x20 || b == 0x7f) {
+            return;
+        }
+        let Ok(body) = String::from_utf8(body) else { return };
+        if body.starts_with("9;4;") || body == "9;4" {
+            self.progress = if body.starts_with("9;4;0") || body == "9;4" { String::new() } else { format!("\x1b]{body}\x07") };
+        } else if body.starts_with("9;") || body.starts_with("777;notify;") {
+            self.event(format!("\x1b]{body}\x07"));
+        } else if body.starts_with("99;") {
+            self.event(format!("\x1b]{body}\x1b\\"));
+        }
     }
 
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
@@ -383,4 +425,21 @@ fn esc_len(b: &[u8]) -> usize {
 
 pub fn nz(v: u16) -> NonZeroU16 {
     NonZeroU16::new(v.max(1)).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notifications_and_progress() {
+        let mut p = vt100::Parser::new_with_callbacks(nz(5), nz(20), 0, Hooks::new());
+        p.process("\x07\x07\x1b]777;notify;Claude;Готово\x07\x1b]9;hi\x1b\\\x1b]99;i=1;x\x1b\\\x1b]9;4;1;42\x07".as_bytes());
+        let h = p.callbacks();
+        let ev: Vec<&str> = h.events.iter().map(|(_, e)| e.as_str()).collect();
+        assert_eq!(ev, ["\x07", "\x1b]777;notify;Claude;Готово\x07", "\x1b]9;hi\x07", "\x1b]99;i=1;x\x1b\\"]);
+        assert_eq!(h.progress, "\x1b]9;4;1;42\x07");
+        p.process(b"\x1b]9;4;0\x07");
+        assert_eq!(p.callbacks().progress, "");
+    }
 }
