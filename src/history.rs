@@ -28,11 +28,13 @@ pub struct Hooks {
     pub replies: Vec<u8>,
     /// Terminal size in pixels (0 = unknown), for size queries.
     pub px: (u16, u16),
+    /// The client terminal's name, for XTVERSION (empty: no answer).
+    pub term: String,
 }
 
 impl Hooks {
     pub fn new() -> Self {
-        Hooks { lines: VecDeque::new(), dropped: 0, title: String::new(), changes: 0, clip: String::new(), clip_seq: 0, replies: Vec::new(), px: (0, 0) }
+        Hooks { lines: VecDeque::new(), dropped: 0, title: String::new(), changes: 0, clip: String::new(), clip_seq: 0, replies: Vec::new(), px: (0, 0), term: String::new() }
     }
 }
 
@@ -73,6 +75,7 @@ impl vt100::Callbacks for Hooks {
             (None, 't', 14) if w > 0 && h > 0 => format!("\x1b[4;{h};{w}t"),
             (None, 't', 16) if w > 0 && h > 0 => format!("\x1b[6;{};{}t", h / rows, w / cols),
             (None, 't', 18) => format!("\x1b[8;{rows};{cols}t"),
+            (Some(b'>'), 'q', 0) if !self.term.is_empty() => format!("\x1bP>|{}\x1b\\", self.term),
             _ => return,
         };
         self.replies.extend_from_slice(r.as_bytes());

@@ -470,6 +470,8 @@ struct Client {
     hist_pending: Vec<String>,
     /// Kitty graphics: whether the terminal can, and the stream from the server.
     graphics: bool,
+    /// Our terminal's name, answered to XTVERSION by the server.
+    term_name: String,
     px: (u16, u16),
     gfx_have: u64,
     /// Chunks that arrived ahead of a gap, by offset.
@@ -579,6 +581,7 @@ fn run(o: Opts, boot: Boot) -> Result<String, String> {
         hist_have: 0,
         hist_pending: Vec::new(),
         graphics: crate::graphics::local_support(),
+        term_name: if crate::graphics::local_support() { crate::graphics::local_name() } else { String::new() },
         px: term::size_px(),
         gfx_have: 0,
         gfx_ahead: Default::default(),
@@ -1225,6 +1228,7 @@ impl Client {
                     px_w: self.px.0,
                     px_h: self.px.1,
                     gfx_have: self.gfx_have,
+                    term: self.term_name.clone(),
                 }
                 .encode();
                 self.seq += 1;

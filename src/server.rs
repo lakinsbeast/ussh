@@ -636,6 +636,9 @@ impl Session {
 
         if newest {
             self.gfx.enabled = msg.graphics;
+            if self.parser.callbacks().term != msg.term {
+                self.parser.callbacks_mut().term = msg.term.clone();
+            }
             if (msg.px_w, msg.px_h) != self.px {
                 self.px = (msg.px_w, msg.px_h);
                 self.parser.callbacks_mut().px = self.px;

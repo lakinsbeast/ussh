@@ -778,6 +778,22 @@ pub fn local_support() -> bool {
     term == "xterm-kitty" || term == "xterm-ghostty" || prog == "ghostty"
 }
 
+/// What to answer XTVERSION with on the terminal's behalf: only for the
+/// terminals whose graphics we pass on (programs such as Claude Code decide
+/// by this name whether to draw images).
+pub fn local_name() -> String {
+    let term = std::env::var("TERM").unwrap_or_default();
+    let prog = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    let ver = std::env::var("TERM_PROGRAM_VERSION").unwrap_or_default();
+    if prog == "ghostty" || term == "xterm-ghostty" {
+        if prog == "ghostty" && !ver.is_empty() { format!("ghostty {ver}") } else { "ghostty".into() }
+    } else if term == "xterm-kitty" {
+        "kitty".into()
+    } else {
+        String::new()
+    }
+}
+
 // -------------------------------------------------------------------- base64
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

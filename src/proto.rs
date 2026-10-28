@@ -35,6 +35,9 @@ pub struct ClientMsg {
     pub px_h: u16,
     /// Graphics stream bytes received so far.
     pub gfx_have: u64,
+    /// The terminal's name for XTVERSION, e.g. `ghostty 1.1.3` (may be
+    /// empty; absent from older clients).
+    pub term: String,
 }
 
 pub struct Frame {
@@ -89,6 +92,7 @@ impl ClientMsg {
         w.u16(self.px_w);
         w.u16(self.px_h);
         w.u64(self.gfx_have);
+        w.bytes(self.term.as_bytes());
         w.0
     }
 
@@ -110,6 +114,7 @@ impl ClientMsg {
             px_w: r.u16()?,
             px_h: r.u16()?,
             gfx_have: r.u64()?,
+            term: r.bytes().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default(),
         })
     }
 }
