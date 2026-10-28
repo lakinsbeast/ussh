@@ -281,8 +281,14 @@ fn bootstrap(o: &Opts, cols: u16, rows: u16, batch: bool) -> Result<Boot, String
 
 /// Copies a local file into the session's paste directory on the server
 /// (over the shared SSH connection) and returns its remote path.
-fn upload(o: &Opts, local: &std::path::Path, name: &str, pid: &std::sync::atomic::AtomicU32) -> Result<String, String> {
-    let file = std::fs::File::open(local).map_err(|e| format!("{}: {e}", local.display()))?;
+fn upload(
+    o: &Opts,
+    local: &std::path::Path,
+    name: &str,
+    pid: &std::sync::atomic::AtomicU32,
+    progress: &mut dyn FnMut(u64),
+) -> Result<String, String> {
+    let mut file = std::fs::File::open(local).map_err(|e| format!("{}: {e}", local.display()))?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
     // Only a complete file gets its final name (a cancelled upload ends the
     // stream early, which `cat` can't tell from a normal end).
@@ -296,12 +302,25 @@ fn upload(o: &Opts, local: &std::path::Path, name: &str, pid: &std::sync::atomic
     let out = ssh_command(o, true)
         .arg(&o.host)
         .arg(script)
-        .stdin(file)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .and_then(|child| {
+        .and_then(|mut child| {
             pid.store(child.id(), Ordering::SeqCst);
+            // We feed the file ourselves to report progress.
+            let mut stdin = child.stdin.take().unwrap();
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut sent = 0u64;
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 || stdin.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+                sent += n as u64;
+                progress(sent);
+            }
+            drop(stdin);
             child.wait_with_output()
         })
         .map_err(|e| format!("ssh: {e}"))?;
@@ -340,6 +359,7 @@ enum Ev {
     RelayDead(u64),
     Reconnected(Result<Box<Boot>, String>),
     ClipChecked(Option<crate::clipboard::Clip>),
+    UploadProgress { done: u64, total: u64, file: usize, files: usize, name: String },
     Uploaded(Result<Vec<String>, String>),
 }
 
@@ -446,6 +466,9 @@ struct Client {
     /// pid of the ssh doing an upload (0 = none), for Ctrl+C to cancel.
     upload_pid: Arc<std::sync::atomic::AtomicU32>,
     status_until: Option<Instant>,
+    /// Top-row notice, repainted over incoming frames while shown.
+    status_text: Option<String>,
+    upload_started: Instant,
 }
 
 enum Exit {
@@ -542,6 +565,8 @@ fn run(o: Opts, boot: Boot) -> Result<String, String> {
         held: Vec::new(),
         upload_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         status_until: None,
+        status_text: None,
+        upload_started: now,
     };
     let ip = resolved.or(boot.server_ip);
     c.server = ip.map(|ip| SocketAddr::new(ip, boot.port));
@@ -695,6 +720,13 @@ impl Client {
                     return self.release_held(now);
                 }
             }
+            Ev::UploadProgress { done, total, file, files, name } => {
+                if self.paste_pending {
+                    let line = self.progress_line(done, total, file, files, &name);
+                    self.status_text = Some(line);
+                    self.draw_status();
+                }
+            }
             Ev::Uploaded(r) => match r {
                 Ok(paths) if !self.paste_pending => drop(paths),
                 Ok(paths) => {
@@ -708,6 +740,7 @@ impl Client {
                         self.input.extend_from_slice(text.as_bytes());
                     }
                     self.status_until = None;
+                    self.status_text = None;
                     self.redraw_local();
                     return self.release_held(now);
                 }
@@ -854,6 +887,7 @@ impl Client {
                         let _ = self.out.write_all(&bytes);
                         let _ = self.out.write_all(b"\x1b[?2026l");
                         let _ = self.out.flush();
+                        self.draw_status();
                         crate::dlog!("cli apply {}->{}", a.base, f.new);
                         self.version = f.new;
                         let v = self.version;
@@ -923,17 +957,33 @@ impl Client {
         } else {
             format!("{} files", files.len())
         };
-        self.status(&format!("ussh: uploading {what} ({})… Ctrl+C cancels", human_size(size)), Duration::from_secs(3600));
+        self.upload_started = Instant::now();
+        let first = self.progress_line(0, size, 1, files.len(), &what);
+        self.status(&first, Duration::from_secs(24 * 3600));
         let (o, tx, pid) = (self.o.clone(), self.tx.clone(), self.upload_pid.clone());
         std::thread::spawn(move || {
             let mut paths = Vec::new();
             let mut result = Ok(());
-            for f in &files {
+            let mut before = 0u64;
+            let mut last_report = Instant::now();
+            let n = files.len();
+            for (i, f) in files.iter().enumerate() {
                 let name = match &temp {
                     Some((_, n)) => n.clone(),
                     None => safe_name(&f.file_name().unwrap_or_default().to_string_lossy()),
                 };
-                match upload(&o, f, &name, &pid) {
+                let shown = f.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                let shown = if temp.is_some() { name.clone() } else { shown };
+                let mut report = |sent: u64| {
+                    if last_report.elapsed() >= Duration::from_millis(100) {
+                        last_report = Instant::now();
+                        let ev = Ev::UploadProgress { done: before + sent, total: size, file: i + 1, files: n, name: shown.clone() };
+                        let _ = tx.send(ev);
+                    }
+                };
+                let r = upload(&o, f, &name, &pid, &mut report);
+                before += f.metadata().map(|m| m.len()).unwrap_or(0);
+                match r {
                     Ok(p) => paths.push(p),
                     Err(e) => {
                         result = Err(e);
@@ -950,13 +1000,42 @@ impl Client {
         true
     }
 
-    /// A one-line notice on the top row until `for` elapses or it's replaced.
+    /// `⬆ name 2/3 ▕██████░░░░▏ 63%  31.5 MB/50.0 MB  12.4 MB/s  Ctrl+C`
+    fn progress_line(&self, done: u64, total: u64, file: usize, files: usize, name: &str) -> String {
+        let cols = self.cols as usize;
+        let pct = if total == 0 { 100 } else { (done.saturating_mul(100) / total).min(100) };
+        let secs = self.upload_started.elapsed().as_secs_f64().max(0.001);
+        let rate = human_size((done as f64 / secs) as u64);
+        let count = if files > 1 { format!(" {file}/{files}") } else { String::new() };
+        let right = format!(" {pct:>3}%  {}/{}  {rate}/s  Ctrl+C cancels ", human_size(done), human_size(total));
+        let budget = cols.saturating_sub(right.chars().count() + 14);
+        // Leave most of the width to the bar itself.
+        let budget = budget.clamp(8, 28);
+        let name: String = if name.chars().count() > budget {
+            name.chars().take(budget - 1).chain(['…']).collect()
+        } else {
+            name.to_string()
+        };
+        let left = format!(" ⬆ {name}{count} ");
+        let bar_w = cols.saturating_sub(left.chars().count() + right.chars().count() + 2).max(4);
+        let filled = (bar_w as u64 * pct / 100) as usize;
+        format!("{left}▕{}{}▏{right}", "█".repeat(filled), "░".repeat(bar_w - filled))
+    }
+
+    /// A one-line notice on the top row until `dur` elapses or it's replaced.
     fn status(&mut self, text: &str, dur: Duration) {
-        let text: String = format!(" {text}").chars().take(self.cols as usize).collect();
+        self.status_text = Some(text.to_string());
+        self.status_until = Some(Instant::now() + dur);
+        self.draw_status();
+    }
+
+    fn draw_status(&mut self) {
+        let Some(text) = &self.status_text else { return };
+        let text: String = if text.starts_with(' ') { text.clone() } else { format!(" {text}") };
+        let text: String = text.chars().take(self.cols as usize).collect();
         let pad = (self.cols as usize).saturating_sub(text.chars().count());
         let _ = write!(self.out, "\x1b7\x1b[1;1H\x1b[0;30;46m{text}{}\x1b[0m\x1b8", " ".repeat(pad));
         let _ = self.out.flush();
-        self.status_until = Some(Instant::now() + dur);
     }
 
     /// Repaint the terminal from the mirror.
@@ -992,6 +1071,7 @@ impl Client {
         s.push_str("\x1b[?2026l");
         let _ = self.out.write_all(s.as_bytes());
         let _ = self.out.flush();
+        self.draw_status();
     }
 
     fn send(&mut self, now: Instant) {
@@ -1047,6 +1127,7 @@ impl Client {
         }
         if self.status_until.is_some_and(|t| now >= t) {
             self.status_until = None;
+            self.status_text = None;
             self.redraw_local();
         }
         if let Some(every) = self.knobs.roam {

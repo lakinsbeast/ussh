@@ -69,27 +69,69 @@ on save(d, p)
 end save
 "#;
 
+/// AppleScriptObjC straight on NSPasteboard: every copied file, and PNG or
+/// TIFF images (TIFF converted to PNG).
+const MACOS_OBJC_SCRIPT: &str = r#"
+use framework "AppKit"
+use scripting additions
+
+on run argv
+	set out to (item 1 of argv) & ".png"
+	set pb to current application's NSPasteboard's generalPasteboard()
+	set urls to pb's readObjectsForClasses:{current application's NSURL} options:(missing value)
+	set paths to {}
+	if urls is not missing value then
+		repeat with u in (urls as list)
+			if (u's isFileURL()) as boolean then set end of paths to ((u's |path|()) as text)
+		end repeat
+	end if
+	if (count of paths) > 0 then
+		set AppleScript's text item delimiters to linefeed
+		return "FILES" & linefeed & (paths as text)
+	end if
+	set png to pb's dataForType:(current application's NSPasteboardTypePNG)
+	if png is missing value then
+		set tiff to pb's dataForType:(current application's NSPasteboardTypeTIFF)
+		if tiff is missing value then return "NONE"
+		set rep to current application's NSBitmapImageRep's imageRepWithData:tiff
+		set png to rep's representationUsingType:(current application's NSBitmapImageFileTypePNG) |properties|:(current application's NSDictionary's dictionary())
+	end if
+	png's writeToFile:out atomically:true
+	return "IMAGE" & linefeed & out
+end run
+"#;
+
 fn macos() -> Option<Clip> {
-    let base = temp_path("x");
-    let base = base.with_extension("");
+    let base = temp_path("x").with_extension("");
+    // The ObjC script sees every file; the classic one is the fallback.
+    let text = osascript(MACOS_OBJC_SCRIPT, &base).filter(|t| t.starts_with("FILES") || t.starts_with("IMAGE") || t.starts_with("NONE"));
+    let text = match text {
+        Some(t) => t,
+        None => osascript(MACOS_SCRIPT, &base)?.replacen('\t', "\n", 1),
+    };
+    let mut lines = text.lines();
+    match lines.next()? {
+        "FILES" | "FILE" => {
+            let files: Vec<PathBuf> = lines.map(PathBuf::from).filter(|p| p.exists()).collect();
+            (!files.is_empty()).then_some(Clip::Files(files))
+        }
+        "IMAGE" => Some(PathBuf::from(lines.next()?)).filter(|p| p.exists()).map(Clip::Image),
+        _ => None,
+    }
+}
+
+fn osascript(script: &str, base: &std::path::Path) -> Option<String> {
     let mut child = Command::new("osascript")
         .arg("-")
-        .arg(&base)
+        .arg(base)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    child.stdin.take()?.write_all(MACOS_SCRIPT.as_bytes()).ok()?;
+    child.stdin.take()?.write_all(script.as_bytes()).ok()?;
     let out = child.wait_with_output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let (kind, path) = text.trim_end().split_once('\t')?;
-    let path = PathBuf::from(path);
-    match kind {
-        "FILE" if path.exists() => Some(Clip::Files(vec![path])),
-        "IMAGE" if path.exists() => Some(Clip::Image(path)),
-        _ => None,
-    }
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim_end().to_string())
 }
 
 fn linux() -> Option<Clip> {
