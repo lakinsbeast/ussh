@@ -3,7 +3,8 @@
 //! through. Reconnects SSH by itself when everything goes quiet.
 
 use crate::crypto::{self, Keys, DIR_TO_CLIENT};
-use crate::proto::{self, ClientMsg, ServerMsg, ESC_BYTE, FLAG_ENDED, FLAG_SUPERSEDED, MAX_INPUT_CHUNK};
+use crate::proto::{self, ClientMsg, FileAck, FileChunk, ServerMsg, ESC_BYTE, FLAG_ENDED, FLAG_SUPERSEDED, MAX_INPUT_CHUNK};
+use crate::proto::{FILE_DONE, FILE_FAILED, MAX_FILE_CHUNK};
 use crate::server::valid_name;
 use crate::term;
 use std::borrow::Cow;
@@ -328,7 +329,9 @@ fn bootstrap(o: &Opts, cols: u16, rows: u16, batch: bool) -> Result<Boot, String
 }
 
 /// Copies a local file into the session's paste directory on the server
-/// (over the shared SSH connection) and returns its remote path.
+/// over SSH and returns its remote path. Only for sessions started by an
+/// older ussh: newer ones take pastes in-band (`Outgoing`), which needs no
+/// login (a password can't be asked mid-session).
 fn upload(
     o: &Opts,
     local: &std::path::Path,
@@ -422,6 +425,196 @@ impl Drop for Relay {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// Upload window (bytes in flight): starts small, grows with acks, shrinks
+/// on loss.
+const UPLOAD_WINDOW: (u64, u64) = (32 << 10, 1 << 20);
+
+/// A paste going up inside the session: one file after another, each in
+/// chunks. The server acks what it has (everything below `acked`, plus
+/// ranges past a gap), and we resend just the gaps.
+struct Outgoing {
+    /// Local path, name on the server, name in the progress bar.
+    files: Vec<(std::path::PathBuf, String, String)>,
+    /// A clipboard image's temp file, deleted when done.
+    temp: Option<std::path::PathBuf>,
+    total: u64,
+    /// Bytes of the files already done, and their server paths.
+    before: u64,
+    paths: Vec<String>,
+    drawn: Instant,
+    window: u64,
+    /// Last time the window shrank (once per round trip at most).
+    cut_at: Instant,
+    srtt: Option<Duration>,
+    // The current file.
+    i: usize,
+    file: std::fs::File,
+    size: u64,
+    id: u32,
+    acked: u64,
+    /// Ranges past `acked` the server has, from its latest ack.
+    sacked: Vec<(u64, u64)>,
+    /// Everything below `sent` went out at least once.
+    sent: u64,
+    /// When each gap (by start) was last resent.
+    resent: std::collections::BTreeMap<u64, Instant>,
+    /// An empty file's only chunk is out.
+    empty_sent: bool,
+    /// Last progress reported by the server: the timeout runs from here.
+    progress_at: Instant,
+    /// A chunk end being timed for the round-trip estimate.
+    probe: Option<(u64, Instant)>,
+}
+
+impl Outgoing {
+    fn new(files: Vec<(std::path::PathBuf, String, String)>, temp: Option<std::path::PathBuf>, total: u64, now: Instant) -> Result<Self, String> {
+        let (file, size) = Self::open(&files[0].0)?;
+        Ok(Outgoing {
+            files,
+            temp,
+            total,
+            before: 0,
+            paths: Vec::new(),
+            drawn: now,
+            window: UPLOAD_WINDOW.0,
+            cut_at: now,
+            srtt: None,
+            i: 0,
+            file,
+            size,
+            id: crypto::random_u64() as u32,
+            acked: 0,
+            sacked: Vec::new(),
+            sent: 0,
+            resent: Default::default(),
+            empty_sent: false,
+            progress_at: now,
+            probe: None,
+        })
+    }
+
+    fn open(path: &std::path::Path) -> Result<(std::fs::File, u64), String> {
+        let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let size = file.metadata().map_err(|e| e.to_string())?.len();
+        Ok((file, size))
+    }
+
+    fn next(&mut self, now: Instant) -> Result<(), String> {
+        (self.file, self.size) = Self::open(&self.files[self.i + 1].0)?;
+        self.i += 1;
+        self.id = crypto::random_u64() as u32;
+        (self.acked, self.sent, self.empty_sent) = (0, 0, false);
+        self.sacked.clear();
+        self.resent.clear();
+        self.progress_at = now;
+        self.probe = None;
+        Ok(())
+    }
+
+    fn rto(&self) -> Duration {
+        self.srtt.map_or(Duration::from_secs(1), |s| (s * 2 + Duration::from_millis(100)).clamp(Duration::from_millis(200), Duration::from_secs(3)))
+    }
+
+    /// The chunk at `off`, up to `end`; the name rides along at offset 0.
+    fn chunk(&self, off: u64, end: u64) -> Result<FileChunk, String> {
+        use std::os::unix::fs::FileExt;
+        let name = if off == 0 { self.files[self.i].1.clone() } else { String::new() };
+        let n = (MAX_FILE_CHUNK - name.len()).min((end - off) as usize);
+        let mut data = vec![0u8; n];
+        self.file.read_exact_at(&mut data, off).map_err(|e| format!("{}: {e}", self.files[self.i].0.display()))?;
+        Ok(FileChunk { id: self.id, total: self.size, off, name, data })
+    }
+
+    /// Chunks to send now: gaps the server reported (or, after a timeout,
+    /// everything it hasn't confirmed), then new data as the window allows.
+    fn due(&mut self, now: Instant) -> Result<Vec<FileChunk>, String> {
+        let mut out = Vec::new();
+        if self.size == 0 {
+            if !self.empty_sent || now.duration_since(self.progress_at) > self.rto() {
+                self.empty_sent = true;
+                self.progress_at = now;
+                out.push(FileChunk { id: self.id, total: 0, off: 0, name: self.files[self.i].1.clone(), data: Vec::new() });
+            }
+            return Ok(out);
+        }
+        let timeout = self.sent > self.acked && now.duration_since(self.progress_at) > self.rto();
+        if timeout {
+            self.window = (self.window / 2).max(UPLOAD_WINDOW.0);
+            self.progress_at = now;
+            self.resent.clear();
+        }
+        // Gaps below the last range the server has are lost (or late); on a
+        // timeout, so is the tail after it.
+        let limit = if timeout { self.sent } else { self.sacked.last().map_or(self.acked, |r| r.1) };
+        let mut gaps = Vec::new();
+        let mut cur = self.acked;
+        for &(s, e) in &self.sacked {
+            if s > cur {
+                gaps.push((cur, s.min(limit)));
+            }
+            cur = cur.max(e);
+        }
+        if cur < limit {
+            gaps.push((cur, limit));
+        }
+        let again = self.srtt.map_or(self.rto(), |s| s + s / 4 + Duration::from_millis(20));
+        let mut budget = self.window;
+        for (s, e) in gaps {
+            if s >= e || budget == 0 || self.resent.get(&s).is_some_and(|t| now.duration_since(*t) < again) {
+                continue;
+            }
+            self.resent.insert(s, now);
+            self.probe = None;
+            if !timeout && self.srtt.is_some_and(|rtt| now.duration_since(self.cut_at) > rtt) {
+                self.window = (self.window * 3 / 4).max(UPLOAD_WINDOW.0);
+                self.cut_at = now;
+            }
+            let mut off = s;
+            while off < e && budget > 0 {
+                let c = self.chunk(off, e)?;
+                off += c.data.len() as u64;
+                budget = budget.saturating_sub(c.data.len() as u64);
+                out.push(c);
+            }
+        }
+        let have: u64 = self.sacked.iter().map(|(s, e)| e - s).sum();
+        while self.sent < self.size && self.sent - self.acked - have.min(self.sent - self.acked) < self.window {
+            if self.sent == self.acked {
+                self.progress_at = now;
+            }
+            let c = self.chunk(self.sent, self.size)?;
+            self.sent += c.data.len() as u64;
+            if self.probe.is_none() {
+                self.probe = Some((self.sent, now));
+            }
+            out.push(c);
+        }
+        Ok(out)
+    }
+
+    fn ack(&mut self, have: u64, ranges: Vec<(u64, u64)>, now: Instant) {
+        let before: u64 = self.sacked.iter().map(|(s, e)| e - s).sum();
+        let after: u64 = ranges.iter().filter(|r| r.0 > have).map(|(s, e)| e - s).sum();
+        if have > self.acked || after > before {
+            self.progress_at = now;
+        }
+        self.sacked = ranges.into_iter().filter(|r| r.0 > have).collect();
+        if have <= self.acked {
+            return;
+        }
+        let gained = have - self.acked;
+        self.acked = have.min(self.size);
+        self.sent = self.sent.max(self.acked);
+        self.resent.retain(|s, _| *s >= have);
+        if let Some((_, t)) = self.probe.filter(|(end, _)| have >= *end) {
+            let sample = now.duration_since(t);
+            self.srtt = Some(self.srtt.map_or(sample, |s| s * 7 / 8 + sample / 8));
+            self.probe = None;
+        }
+        self.window = (self.window + gained).min(UPLOAD_WINDOW.1);
     }
 }
 
@@ -522,6 +715,9 @@ struct Client {
     held: Vec<u8>,
     /// pid of the ssh doing an upload (0 = none), for Ctrl+C to cancel.
     upload_pid: Arc<std::sync::atomic::AtomicU32>,
+    /// A paste going up in-band, and whether the server takes those.
+    upload: Option<Outgoing>,
+    server_files: bool,
     status_until: Option<Instant>,
     /// Top-row notice, repainted over incoming frames while shown.
     status_text: Option<String>,
@@ -629,6 +825,8 @@ fn run(o: Opts, boot: Boot, picked: bool) -> Result<String, String> {
         paste_pending: false,
         held: Vec::new(),
         upload_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        upload: None,
+        server_files: false,
         status_until: None,
         status_text: None,
         paste_buf: None,
@@ -661,7 +859,9 @@ fn run(o: Opts, boot: Boot, picked: bool) -> Result<String, String> {
                 return Ok(c.finish(raw, exit));
             }
         }
-        c.tick();
+        if let Some(exit) = c.tick() {
+            break exit;
+        }
     };
     Ok(c.finish(raw, result))
 }
@@ -802,29 +1002,7 @@ impl Client {
                     self.draw_status();
                 }
             }
-            Ev::Uploaded(r) => match r {
-                Ok(paths) if !self.paste_pending => drop(paths),
-                Ok(paths) => {
-                    // Typed in as if dropped onto the terminal.
-                    let text = paths.join(" ");
-                    if self.mirror.screen().bracketed_paste() {
-                        self.input.extend_from_slice(b"\x1b[200~");
-                        self.input.extend_from_slice(text.as_bytes());
-                        self.input.extend_from_slice(b"\x1b[201~");
-                    } else {
-                        self.input.extend_from_slice(text.as_bytes());
-                    }
-                    self.status_until = None;
-                    self.status_text = None;
-                    self.redraw_local();
-                    return self.release_held(now);
-                }
-                Err(_) if !self.paste_pending => {}
-                Err(e) => {
-                    self.status(&format!("ussh: upload failed: {e}"), Duration::from_secs(4));
-                    return self.release_held(now);
-                }
-            },
+            Ev::Uploaded(r) => return self.uploaded(r, now),
             Ev::Reconnected(r) => {
                 self.reconnecting = false;
                 match r {
@@ -842,6 +1020,87 @@ impl Client {
                     }
                 }
             }
+        }
+        None
+    }
+
+    /// A paste is up (or failed): type its paths in, then the keys held
+    /// back meanwhile.
+    fn uploaded(&mut self, r: Result<Vec<String>, String>, now: Instant) -> Option<Exit> {
+        match r {
+            Ok(paths) if !self.paste_pending => drop(paths),
+            Ok(paths) => {
+                // Typed in as if dropped onto the terminal.
+                let text = paths.join(" ");
+                if self.mirror.screen().bracketed_paste() {
+                    self.input.extend_from_slice(b"\x1b[200~");
+                    self.input.extend_from_slice(text.as_bytes());
+                    self.input.extend_from_slice(b"\x1b[201~");
+                } else {
+                    self.input.extend_from_slice(text.as_bytes());
+                }
+                self.status_until = None;
+                self.status_text = None;
+                self.redraw_local();
+                return self.release_held(now);
+            }
+            Err(_) if !self.paste_pending => {}
+            Err(e) => {
+                self.status(&format!("ussh: upload failed: {e}"), Duration::from_secs(4));
+                return self.release_held(now);
+            }
+        }
+        None
+    }
+
+    /// Ends the in-band upload (removing a clipboard image's temp file).
+    fn end_upload(&mut self, r: Result<Vec<String>, String>, now: Instant) -> Option<Exit> {
+        if let Some(t) = self.upload.take().and_then(|u| u.temp) {
+            let _ = std::fs::remove_file(t);
+        }
+        self.uploaded(r, now)
+    }
+
+    fn on_file_ack(&mut self, a: FileAck, now: Instant) -> Option<Exit> {
+        let u = self.upload.as_mut()?;
+        if a.id != u.id {
+            return None;
+        }
+        match a.state {
+            FILE_FAILED => return self.end_upload(Err(a.text), now),
+            FILE_DONE => {
+                u.paths.push(a.text);
+                u.before += u.size;
+                if u.i + 1 == u.files.len() {
+                    let paths = std::mem::take(&mut u.paths);
+                    return self.end_upload(Ok(paths), now);
+                }
+                if let Err(e) = u.next(now) {
+                    return self.end_upload(Err(e), now);
+                }
+            }
+            _ => u.ack(a.have, a.ranges, now),
+        }
+        self.pump_upload(now)
+    }
+
+    /// Sends the upload chunks that are due and updates the progress bar.
+    fn pump_upload(&mut self, now: Instant) -> Option<Exit> {
+        let u = self.upload.as_mut()?;
+        let chunks = match u.due(now) {
+            Ok(c) => c,
+            Err(e) => return self.end_upload(Err(e), now),
+        };
+        let shown = (now.duration_since(u.drawn) >= Duration::from_millis(100)).then(|| {
+            u.drawn = now;
+            (u.before + u.acked, u.total, u.i + 1, u.files.len(), u.files[u.i].2.clone())
+        });
+        for c in chunks {
+            self.transmit(self.input_base, Vec::new(), Some(c));
+        }
+        if let Some((done, total, file, files, name)) = shown.filter(|_| self.paste_pending) {
+            self.status_text = Some(self.progress_line(done, total, file, files, &name));
+            self.draw_status();
         }
         None
     }
@@ -925,12 +1184,17 @@ impl Client {
             i = next;
             if self.paste_pending {
                 let pid = self.upload_pid.load(Ordering::SeqCst);
-                if b == 0x03 && pid != 0 {
+                if b == 0x03 && (pid != 0 || self.upload.is_some()) {
                     // Ctrl+C cancels the upload.
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
+                    if pid != 0 {
+                        unsafe {
+                            libc::kill(pid as i32, libc::SIGTERM);
+                        }
                     }
                     self.upload_pid.store(0, Ordering::SeqCst);
+                    if let Some(t) = self.upload.take().and_then(|u| u.temp) {
+                        let _ = std::fs::remove_file(t);
+                    }
                     self.status("ussh: upload cancelled", Duration::from_secs(2));
                     self.paste_pending = false;
                     let mut rest = std::mem::take(&mut self.held);
@@ -981,7 +1245,7 @@ impl Client {
         let (n, code, mods, event) = csi_u(b)?;
         let mods = mods & !(64 | 128); // caps and num lock
         let ctrl = mods & !1 == 4;
-        let uploading = self.paste_pending && self.upload_pid.load(Ordering::SeqCst) != 0;
+        let uploading = self.paste_pending && (self.upload_pid.load(Ordering::SeqCst) != 0 || self.upload.is_some());
         let byte = match code {
             54 | 94 if ctrl => ESC_BYTE,
             118 if mods == 4 => 0x16,
@@ -1009,6 +1273,7 @@ impl Client {
         }
 
         self.last_recv = now;
+        self.server_files = msg.files;
         if via_udp {
             self.last_udp = Some(now);
         }
@@ -1028,6 +1293,11 @@ impl Client {
             let n = ((msg.input_ack - self.input_base) as usize).min(self.input.len());
             self.input.drain(..n);
             self.input_base += n as u64;
+        }
+        if let Some(a) = msg.file {
+            if let Some(exit) = self.on_file_ack(a, now) {
+                return Some(exit);
+            }
         }
         if let Some(f) = msg.frame {
             if f.new > self.version && f.count > 0 && f.idx < f.count {
@@ -1163,9 +1433,32 @@ impl Client {
         } else {
             format!("{} files", files.len())
         };
+        // (name on the server, name in the progress bar)
+        let names: Vec<(String, String)> = files
+            .iter()
+            .map(|f| match &temp {
+                Some((_, n)) => (n.clone(), n.clone()),
+                None => {
+                    let shown = f.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    (safe_name(&shown), shown)
+                }
+            })
+            .collect();
         self.upload_started = Instant::now();
         let first = self.progress_line(0, size, 1, files.len(), &what);
         self.status(&first, Duration::from_secs(24 * 3600));
+        if self.server_files {
+            let list = files.into_iter().zip(names).map(|(f, (name, shown))| (f, name, shown)).collect();
+            match Outgoing::new(list, temp.map(|t| t.0), size, self.upload_started) {
+                Ok(u) => self.upload = Some(u),
+                Err(e) => {
+                    self.status(&format!("ussh: upload failed: {e}"), Duration::from_secs(4));
+                    return false;
+                }
+            }
+            self.pump_upload(Instant::now());
+            return true;
+        }
         let (o, tx, pid) = (self.o.clone(), self.tx.clone(), self.upload_pid.clone());
         std::thread::spawn(move || {
             let mut paths = Vec::new();
@@ -1173,13 +1466,7 @@ impl Client {
             let mut before = 0u64;
             let mut last_report = Instant::now();
             let n = files.len();
-            for (i, f) in files.iter().enumerate() {
-                let name = match &temp {
-                    Some((_, n)) => n.clone(),
-                    None => safe_name(&f.file_name().unwrap_or_default().to_string_lossy()),
-                };
-                let shown = f.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                let shown = if temp.is_some() { name.clone() } else { shown };
+            for (i, (f, (name, shown))) in files.iter().zip(&names).enumerate() {
                 let mut report = |sent: u64| {
                     if last_report.elapsed() >= Duration::from_millis(100) {
                         last_report = Instant::now();
@@ -1187,7 +1474,7 @@ impl Client {
                         let _ = tx.send(ev);
                     }
                 };
-                let r = upload(&o, f, &name, &pid, &mut report);
+                let r = upload(&o, f, name, &pid, &mut report);
                 before += f.metadata().map(|m| m.len()).unwrap_or(0);
                 match r {
                     Ok(p) => paths.push(p),
@@ -1281,49 +1568,18 @@ impl Client {
     }
 
     fn send(&mut self, now: Instant) {
-        let mut chunks: Vec<(u64, &[u8])> = self
+        let mut chunks: Vec<(u64, Vec<u8>)> = self
             .input
             .chunks(MAX_INPUT_CHUNK)
             .take(32)
             .enumerate()
-            .map(|(i, c)| (self.input_base + (i * MAX_INPUT_CHUNK) as u64, c))
+            .map(|(i, c)| (self.input_base + (i * MAX_INPUT_CHUNK) as u64, c.to_vec()))
             .collect();
         if chunks.is_empty() {
-            chunks.push((self.input_base, &[]));
+            chunks.push((self.input_base, Vec::new()));
         }
-        let wires: Vec<Vec<u8>> = chunks
-            .into_iter()
-            .map(|(off, data)| {
-                let msg = ClientMsg {
-                    instance: self.instance,
-                    epoch: self.epoch,
-                    ack: self.version,
-                    input_off: off,
-                    input: data.to_vec(),
-                    cols: self.cols,
-                    rows: self.rows,
-                    hist_have: self.hist_have,
-                    graphics: self.graphics,
-                    px_w: self.px.0,
-                    px_h: self.px.1,
-                    gfx_have: self.gfx_have,
-                    term: self.term_name.clone(),
-                }
-                .encode();
-                self.seq += 1;
-                self.keys.seal(&self.mask, self.generation, self.seq, &msg)
-            })
-            .collect();
-        for w in wires {
-            if self.knobs.lose() {
-                continue;
-            }
-            if let (Some(sock), Some(server)) = (&self.udp, self.server) {
-                let _ = sock.send_to(&w, server);
-            }
-            if let Some(r) = &self.relay {
-                let _ = r.tx.try_send(w);
-            }
+        for (off, data) in chunks {
+            self.transmit(off, data, None);
         }
         self.last_send = now;
         if !self.input.is_empty() {
@@ -1331,7 +1587,39 @@ impl Client {
         }
     }
 
-    fn tick(&mut self) {
+    /// One packet to the server, over UDP and the SSH relay (if up).
+    fn transmit(&mut self, input_off: u64, input: Vec<u8>, file: Option<FileChunk>) {
+        let msg = ClientMsg {
+            instance: self.instance,
+            epoch: self.epoch,
+            ack: self.version,
+            input_off,
+            input,
+            cols: self.cols,
+            rows: self.rows,
+            hist_have: self.hist_have,
+            graphics: self.graphics,
+            px_w: self.px.0,
+            px_h: self.px.1,
+            gfx_have: self.gfx_have,
+            term: self.term_name.clone(),
+            file,
+        }
+        .encode();
+        self.seq += 1;
+        let w = self.keys.seal(&self.mask, self.generation, self.seq, &msg);
+        if self.knobs.lose() {
+            return;
+        }
+        if let (Some(sock), Some(server)) = (&self.udp, self.server) {
+            let _ = sock.send_to(&w, server);
+        }
+        if let Some(r) = &self.relay {
+            let _ = r.tx.try_send(w);
+        }
+    }
+
+    fn tick(&mut self) -> Option<Exit> {
         let now = Instant::now();
         if self.overlay_drawn.is_none() {
             self.flush_history();
@@ -1382,5 +1670,6 @@ impl Client {
             let _ = self.out.flush();
             self.overlay_drawn = Some(now);
         }
+        self.pump_upload(now)
     }
 }

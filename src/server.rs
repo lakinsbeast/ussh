@@ -11,7 +11,8 @@
 use crate::crypto::{self, Keys, DIR_TO_CLIENT};
 use crate::graphics::{Gfx, Piece, Splitter};
 use crate::history::{self, Hooks, KeyResult, Viewer};
-use crate::proto::{self, ClientMsg, Frame, GfxChunk, Hist, ServerMsg, ESC_BYTE, FLAG_ENDED, FLAG_SUPERSEDED, MAX_FRAG};
+use crate::proto::{self, ClientMsg, FileAck, FileChunk, Frame, GfxChunk, Hist, ServerMsg, ESC_BYTE, FLAG_ENDED, FLAG_SUPERSEDED, MAX_FRAG};
+use crate::proto::{FILE_DONE, FILE_FAILED, FILE_RECEIVING};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -31,6 +32,10 @@ const HIST_WINDOW: u64 = 600;
 /// Backlog that counts as a flood, and how much of it to keep.
 const HIST_SKIP_AT: u64 = 3000;
 const HIST_SKIP_TO: u64 = 300;
+/// How far past the first missing byte upload chunks are taken.
+const UPLOAD_AHEAD: u64 = 16 << 20;
+/// Ranges past a gap reported in one upload ack.
+const UPLOAD_RANGES: usize = 32;
 
 pub fn main(args: &[String]) -> i32 {
     let r = match args.first().map(String::as_str) {
@@ -346,6 +351,143 @@ struct Session {
     ack_pending: bool,
     viewer: Option<Viewer>,
     ended: Option<Instant>,
+    /// The file being pasted, and whether its state is owed to the client.
+    upload: Option<Incoming>,
+    upload_reply: bool,
+    /// Recent upload ids: a late duplicate of an earlier file's first chunk
+    /// must not restart that file.
+    upload_ids: Vec<u32>,
+}
+
+/// A pasted file arriving in chunks, written into the session's paste
+/// directory under `<name>.part` until complete.
+struct Incoming {
+    id: u32,
+    total: u64,
+    /// Everything below `have` is written; `ahead` holds ranges past a gap.
+    have: u64,
+    ahead: BTreeMap<u64, u64>,
+    file: Option<std::fs::File>,
+    path: PathBuf,
+    part: PathBuf,
+    state: u8,
+    text: String,
+}
+
+impl Incoming {
+    fn start(session: &str, c: &FileChunk) -> Incoming {
+        let mut u = Incoming {
+            id: c.id,
+            total: c.total,
+            have: 0,
+            ahead: BTreeMap::new(),
+            file: None,
+            path: PathBuf::new(),
+            part: PathBuf::new(),
+            state: FILE_RECEIVING,
+            text: String::new(),
+        };
+        let open = || -> Result<(PathBuf, PathBuf, std::fs::File), String> {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = run_dir()?.join(format!("{session}.files"));
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            let name = crate::clipboard::safe_name(&c.name);
+            let free = |p: &PathBuf| !p.exists() && !part_of(p).exists();
+            let path = std::iter::once(dir.join(&name))
+                .chain((1..).map(|i| dir.join(format!("{i}-{name}"))))
+                .find(free)
+                .unwrap();
+            let part = part_of(&path);
+            let file = std::fs::File::create(&part).map_err(|e| e.to_string())?;
+            Ok((path, part, file))
+        };
+        match open() {
+            Ok((path, part, file)) => (u.path, u.part, u.file) = (path, part, Some(file)),
+            Err(e) => u.fail(e),
+        }
+        u.take(c.off, &c.data);
+        u
+    }
+
+    fn take(&mut self, off: u64, data: &[u8]) {
+        use std::os::unix::fs::FileExt;
+        if self.state != FILE_RECEIVING {
+            return;
+        }
+        let end = off + data.len() as u64;
+        if !data.is_empty() && end <= self.total && end > self.have && off <= self.have + UPLOAD_AHEAD {
+            if let Err(e) = self.file.as_ref().unwrap().write_at(data, off) {
+                return self.fail(e.to_string());
+            }
+            if off <= self.have {
+                self.have = end;
+            } else {
+                self.add_ahead(off, end);
+            }
+            while let Some((&s, &e)) = self.ahead.first_key_value() {
+                if s > self.have {
+                    break;
+                }
+                self.have = self.have.max(e);
+                self.ahead.pop_first();
+            }
+        }
+        if self.have == self.total {
+            self.file = None;
+            match std::fs::rename(&self.part, &self.path) {
+                Ok(()) => {
+                    self.state = FILE_DONE;
+                    self.text = self.path.to_string_lossy().into_owned();
+                }
+                Err(e) => self.fail(e.to_string()),
+            }
+        }
+    }
+
+    /// Records `off..end` past the gap, merged with ranges it touches.
+    fn add_ahead(&mut self, mut off: u64, mut end: u64) {
+        if let Some((&s, &e)) = self.ahead.range(..=off).next_back() {
+            if e >= off {
+                self.ahead.remove(&s);
+                (off, end) = (s, e.max(end));
+            }
+        }
+        while let Some((&s, &e)) = self.ahead.range(off..).next() {
+            if s > end {
+                break;
+            }
+            self.ahead.remove(&s);
+            end = end.max(e);
+        }
+        self.ahead.insert(off, end);
+    }
+
+    fn fail(&mut self, e: String) {
+        self.file = None;
+        let _ = std::fs::remove_file(&self.part);
+        self.state = FILE_FAILED;
+        self.text = e;
+    }
+
+    fn ack(&self) -> FileAck {
+        let ranges = self.ahead.iter().take(UPLOAD_RANGES).map(|(&s, &e)| (s, e)).collect();
+        FileAck { id: self.id, have: self.have, ranges, state: self.state, text: self.text.clone() }
+    }
+}
+
+impl Drop for Incoming {
+    fn drop(&mut self) {
+        if self.state == FILE_RECEIVING {
+            let _ = std::fs::remove_file(&self.part);
+        }
+    }
+}
+
+fn part_of(path: &std::path::Path) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".part");
+    p.into()
 }
 
 fn run_session(name: &str, cols: &str, rows: &str, env: &str) -> Result<(), String> {
@@ -513,12 +655,15 @@ fn run_session(name: &str, cols: &str, rows: &str, env: &str) -> Result<(), Stri
         ack_pending: false,
         viewer: None,
         ended: None,
+        upload: None,
+        upload_reply: false,
+        upload_ids: Vec::new(),
     };
     eprintln!("ussh session {name}: udp port {port}, pid {}", std::process::id());
 
     loop {
         let loop_start = Instant::now();
-        let busy = s.dirty || s.last_sent > s.acked || s.ack_pending || s.ended.is_some() || s.hist_pending() || s.gfx_pending();
+        let busy = s.dirty || s.last_sent > s.acked || s.ack_pending || s.ended.is_some() || s.hist_pending() || s.gfx_pending() || s.upload_reply;
         let timeout = if busy { Duration::from_millis(1) } else { Duration::from_millis(100) };
         match rx.recv_timeout(timeout) {
             Ok(ev) => s.handle(ev),
@@ -682,7 +827,7 @@ impl Session {
         if hdr.generation != self.cur_gen {
             // An older client: tell it someone else took over.
             g.seq += 1;
-            let msg = ServerMsg { flags: FLAG_SUPERSEDED, input_ack: 0, frame: None, hist: None, gfx: None }.encode();
+            let msg = ServerMsg { flags: FLAG_SUPERSEDED, input_ack: 0, frame: None, hist: None, gfx: None, file: None, files: true }.encode();
             let out = g.keys.seal(&self.mask, hdr.generation, DIR_TO_CLIENT | g.seq, &msg);
             let _ = self.udp.send_to(&out, from);
             return;
@@ -783,6 +928,24 @@ impl Session {
                 self.last_input_at = Some(now);
             }
             self.ack_pending = true;
+        }
+
+        if let Some(c) = msg.file {
+            match &mut self.upload {
+                Some(u) if u.id == c.id => u.take(c.off, &c.data),
+                // A new upload starts with its first chunk (it has the name).
+                _ if c.off == 0 && !self.upload_ids.contains(&c.id) => {
+                    if self.upload_ids.len() >= 64 {
+                        self.upload_ids.remove(0);
+                    }
+                    self.upload_ids.push(c.id);
+                    // (An unfinished one goes first, freeing its name.)
+                    self.upload = None;
+                    self.upload = Some(Incoming::start(&self.name, &c));
+                }
+                _ => {}
+            }
+            self.upload_reply = true;
         }
     }
 
@@ -930,7 +1093,7 @@ impl Session {
     }
 
     fn send_msg(&mut self, flags: u8, frame: Option<Frame>, hist: Option<Hist>) {
-        self.send_full(ServerMsg { flags, input_ack: self.input_expected, frame, hist, gfx: None });
+        self.send_full(ServerMsg { flags, input_ack: self.input_expected, frame, hist, gfx: None, file: None, files: true });
     }
 
     fn send_full(&mut self, msg: ServerMsg) {
@@ -1016,6 +1179,10 @@ impl Session {
         }
         self.send_history(now, rto);
         self.send_graphics(now, rto);
+        if std::mem::take(&mut self.upload_reply) {
+            let file = self.upload.as_ref().map(Incoming::ack);
+            self.send_full(ServerMsg { flags: 0, input_ack: self.input_expected, frame: None, hist: None, gfx: None, file, files: true });
+        }
         false
     }
 
@@ -1107,7 +1274,7 @@ impl Session {
             let start = st.sent;
             let reset = start == st.floor && start > st.reported;
             self.gfx.stream.sent += data.len() as u64;
-            self.send_full(ServerMsg { flags: 0, input_ack: self.input_expected, frame: None, hist: None, gfx: Some(GfxChunk { start, reset, data }) });
+            self.send_full(ServerMsg { flags: 0, input_ack: self.input_expected, frame: None, hist: None, gfx: Some(GfxChunk { start, reset, data }), file: None, files: true });
             packets += 1;
         }
     }

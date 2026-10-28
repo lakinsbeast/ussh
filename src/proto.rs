@@ -10,6 +10,8 @@ pub const PROTO: u8 = 3;
 pub const MAX_FRAG: usize = 1100;
 /// Max keystroke bytes per client packet.
 pub const MAX_INPUT_CHUNK: usize = 1000;
+/// Max upload bytes (plus file name) per client packet.
+pub const MAX_FILE_CHUNK: usize = 1000;
 
 pub const FLAG_ENDED: u8 = 1;
 pub const FLAG_SUPERSEDED: u8 = 2;
@@ -38,6 +40,35 @@ pub struct ClientMsg {
     /// The terminal's name for XTVERSION, e.g. `ghostty 1.1.3` (may be
     /// empty; absent from older clients).
     pub term: String,
+    /// A piece of a file being pasted (absent from older clients).
+    pub file: Option<FileChunk>,
+}
+
+/// Bytes `off..off+data.len()` of upload `id`. Pasted files travel inside
+/// the session, so they need no SSH login and survive roaming.
+pub struct FileChunk {
+    pub id: u32,
+    pub total: u64,
+    pub off: u64,
+    /// The file name, sent with the chunk at offset 0 only.
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
+/// Upload states in `FileAck`.
+pub const FILE_RECEIVING: u8 = 0;
+pub const FILE_DONE: u8 = 1;
+pub const FILE_FAILED: u8 = 2;
+
+/// The server's answer to file chunks: it has everything below `have`,
+/// and the ranges past it in `ranges` (the first few, in order).
+pub struct FileAck {
+    pub id: u32,
+    pub have: u64,
+    pub ranges: Vec<(u64, u64)>,
+    pub state: u8,
+    /// The file's path on the server once done, or the error.
+    pub text: String,
 }
 
 pub struct Frame {
@@ -74,6 +105,10 @@ pub struct ServerMsg {
     pub frame: Option<Frame>,
     pub hist: Option<Hist>,
     pub gfx: Option<GfxChunk>,
+    pub file: Option<FileAck>,
+    /// The server takes uploads in-band (always so for this build; older
+    /// servers leave the field out).
+    pub files: bool,
 }
 
 impl ClientMsg {
@@ -93,6 +128,17 @@ impl ClientMsg {
         w.u16(self.px_h);
         w.u64(self.gfx_have);
         w.bytes(self.term.as_bytes());
+        match &self.file {
+            None => w.u8(0),
+            Some(f) => {
+                w.u8(1);
+                w.u32(f.id);
+                w.u64(f.total);
+                w.u64(f.off);
+                w.bytes(f.name.as_bytes());
+                w.bytes(&f.data);
+            }
+        }
         w.0
     }
 
@@ -101,7 +147,7 @@ impl ClientMsg {
         if r.u8()? != PROTO {
             return None;
         }
-        Some(ClientMsg {
+        let mut msg = ClientMsg {
             instance: r.u64()?,
             epoch: r.u32()?,
             ack: r.u64()?,
@@ -115,7 +161,18 @@ impl ClientMsg {
             px_h: r.u16()?,
             gfx_have: r.u64()?,
             term: r.bytes().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default(),
-        })
+            file: None,
+        };
+        if r.u8() == Some(1) {
+            msg.file = Some(FileChunk {
+                id: r.u32()?,
+                total: r.u64()?,
+                off: r.u64()?,
+                name: String::from_utf8_lossy(r.bytes()?).into_owned(),
+                data: r.bytes()?.to_vec(),
+            });
+        }
+        Some(msg)
     }
 }
 
@@ -156,6 +213,21 @@ impl ServerMsg {
                 w.bytes(&g.data);
             }
         }
+        match &self.file {
+            None => w.u8(0),
+            Some(f) => {
+                w.u8(1);
+                w.u32(f.id);
+                w.u64(f.have);
+                w.u8(f.ranges.len() as u8);
+                for &(s, e) in &f.ranges {
+                    w.u64(s);
+                    w.u64(e);
+                }
+                w.u8(f.state);
+                w.bytes(f.text.as_bytes());
+            }
+        }
         w.0
     }
 
@@ -186,7 +258,17 @@ impl ServerMsg {
             0 => None,
             _ => Some(GfxChunk { start: r.u64()?, reset: r.u8()? != 0, data: r.bytes()?.to_vec() }),
         };
-        Some(ServerMsg { flags, input_ack, frame, hist, gfx })
+        let (files, file) = match r.u8() {
+            None => (false, None),
+            Some(0) => (true, None),
+            Some(_) => {
+                let (id, have) = (r.u32()?, r.u64()?);
+                let ranges = (0..r.u8()?).map(|_| Some((r.u64()?, r.u64()?))).collect::<Option<_>>()?;
+                let ack = FileAck { id, have, ranges, state: r.u8()?, text: String::from_utf8_lossy(r.bytes()?).into_owned() };
+                (true, Some(ack))
+            }
+        };
+        Some(ServerMsg { flags, input_ack, frame, hist, gfx, file, files })
     }
 }
 
