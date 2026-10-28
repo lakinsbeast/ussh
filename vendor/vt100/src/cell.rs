@@ -14,7 +14,7 @@ pub struct Cell {
     len: u8,
     attrs: crate::attrs::Attrs,
 }
-const _: () = assert!(core::mem::size_of::<Cell>() == 32);
+const _: () = assert!(core::mem::size_of::<Cell>() == 36);
 
 impl PartialEq<Self> for Cell {
     fn eq(&self, other: &Self) -> bool {

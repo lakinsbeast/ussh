@@ -85,6 +85,9 @@ pub struct Screen {
 
     attrs: crate::attrs::Attrs,
     saved_attrs: crate::attrs::Attrs,
+    /// The open OSC 8 hyperlink, applied to printed text only (not to
+    /// erased cells, and SGR 0 leaves it alone).
+    link: u16,
 
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
@@ -115,6 +118,7 @@ impl Screen {
 
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
+            link: 0,
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -1068,7 +1072,10 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
     pub fn text(&mut self, c: char) {
         let screen = &mut self.screen;
         let pos = screen.grid().pos();
-        let attrs = screen.attrs;
+        let attrs = crate::attrs::Attrs {
+            link: screen.link,
+            ..screen.attrs
+        };
 
         let Some(width) = screen.calculate_width(c) else {
             return;
@@ -1202,6 +1209,11 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
     // ESC M
     pub fn ri(&mut self) {
         self.screen.grid_mut().row_dec_scroll(1);
+    }
+
+    // OSC 8
+    pub fn set_hyperlink(&mut self, params: &[u8], uri: &[u8]) {
+        self.screen.link = crate::links::intern(params, uri);
     }
 
     // ESC c

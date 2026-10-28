@@ -112,8 +112,10 @@ impl<'a> Iterator for BasicFormattedToPlainIndexed<'a> {
             };
 
             self.index += before.len() + 1;
+            // SGR runs to `m`; OSC 8 hyperlinks run to BEL.
+            let end = if after.starts_with(']') { '\x07' } else { 'm' };
             self.capture =
-                if let Some((esc_body, after_esc)) = after.split_once('m') {
+                if let Some((esc_body, after_esc)) = after.split_once(end) {
                     self.index += esc_body.len() + 1;
                     after_esc
                 } else {
@@ -196,7 +198,12 @@ impl<'a> Iterator for BasicFormattedRows<'a> {
 
         while let Some((i, c)) = chars.next() {
             if c == '\x1b' {
-                while chars.next().is_some_and(|(_, c)| c != 'm') {}
+                let end = if capture[i + 1..].starts_with(']') {
+                    '\x07'
+                } else {
+                    'm'
+                };
+                while chars.next().is_some_and(|(_, c)| c != end) {}
                 continue;
             }
             if c == '\n' {

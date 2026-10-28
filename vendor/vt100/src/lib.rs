@@ -56,6 +56,7 @@ mod callbacks;
 pub mod capture;
 mod cell;
 mod grid;
+mod links;
 mod parser;
 mod perform;
 mod row;

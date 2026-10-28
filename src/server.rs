@@ -1,6 +1,6 @@
 //! Server side. Three entry points, all run as the remote user:
 //!
-//! * `ussh server connect NAME COLS ROWS COLORTERM` — run by the client over
+//! * `ussh server connect NAME COLS ROWS ENV` — run by the client over
 //!   SSH. Finds (or spawns) the session process, obtains fresh credentials,
 //!   prints them, then stays alive as a relay that forwards packets between
 //!   its stdio and the session's UDP port. That relay is the TCP fallback.
@@ -112,7 +112,7 @@ fn pick_session() -> Result<(String, std::fs::File), String> {
     Ok((name, lock))
 }
 
-fn connect(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<(), String> {
+fn connect(name: &str, cols: &str, rows: &str, env: &str) -> Result<(), String> {
     let (name, lock) = if name == "@auto" {
         let (n, l) = pick_session()?;
         (n, Some(l))
@@ -133,7 +133,7 @@ fn connect(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<(), St
             Ok(r) => break r,
             Err(e) if spawned && Instant::now() > deadline => return Err(format!("session did not start: {e}")),
             Err(_) if !spawned && UnixStream::connect(sock_path(name)?).is_err() => {
-                spawn_session(name, cols, rows, colorterm)?;
+                spawn_session(name, cols, rows, env)?;
                 spawned = true;
             }
             Err(_) => {}
@@ -199,7 +199,7 @@ fn relay(port: u16) -> Result<(), String> {
     }
 }
 
-fn spawn_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<(), String> {
+fn spawn_session(name: &str, cols: &str, rows: &str, env: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -207,7 +207,7 @@ fn spawn_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<
         .open(run_dir()?.join(format!("{name}.log")))
         .map_err(|e| e.to_string())?;
     let mut cmd = Command::new(exe);
-    cmd.args(["server", "session", name, cols, rows, colorterm])
+    cmd.args(["server", "session", name, cols, rows, env])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log);
@@ -292,6 +292,8 @@ struct Snap {
 }
 
 struct Session {
+    /// Session name, shown in the client's window title.
+    name: String,
     parser: vt100::Parser<Hooks>,
     master: Box<dyn MasterPty + Send>,
     pty_in: mpsc::Sender<Vec<u8>>,
@@ -346,7 +348,7 @@ struct Session {
     ended: Option<Instant>,
 }
 
-fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<(), String> {
+fn run_session(name: &str, cols: &str, rows: &str, env: &str) -> Result<(), String> {
     let cols: u16 = cols.parse().unwrap_or(80).clamp(2, 1000);
     let rows: u16 = rows.parse().unwrap_or(24).clamp(2, 1000);
     let path = sock_path(name)?;
@@ -365,8 +367,14 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
     let mut cmd = CommandBuilder::new_default_prog();
     cmd.env("TERM", "xterm-256color");
     cmd.env("USSH_SESSION", name);
-    if colorterm != "-" {
-        cmd.env("COLORTERM", colorterm);
+    // `K=V,K=V` from the client's environment (a bare value is COLORTERM,
+    // as older clients sent it).
+    for kv in env.split(',').filter(|s| *s != "-") {
+        match kv.split_once('=') {
+            Some((k @ ("COLORTERM" | "TERM_PROGRAM" | "TERM_PROGRAM_VERSION"), v)) => cmd.env(k, v),
+            Some(_) => {}
+            None => cmd.env("COLORTERM", kv),
+        }
     }
     if let Ok(home) = std::env::var("HOME") {
         cmd.cwd(home);
@@ -459,6 +467,7 @@ fn run_session(name: &str, cols: &str, rows: &str, colorterm: &str) -> Result<()
 
     let now = Instant::now();
     let mut s = Session {
+        name: name.to_string(),
         parser: vt100::Parser::new_with_callbacks(history::nz(rows), history::nz(cols), 0, Hooks::new()),
         master: pair.master,
         pty_in,
@@ -852,7 +861,9 @@ impl Session {
         let hooks = self.parser.callbacks();
         // The viewer reads plain keys.
         let kbd = if self.viewer.is_some() { 0 } else { hooks.kbd_flags(self.parser.screen().alternate_screen()) };
-        Snap { screen, title: hooks.title.clone(), clip_seq: hooks.clip_seq, event_seq: hooks.event_seq, progress: hooks.progress.clone(), kbd }
+        // The session name leads, so tabs stay apart when titles are cut.
+        let title = if hooks.title.is_empty() { self.name.clone() } else { format!("{} · {}", self.name, hooks.title) };
+        Snap { screen, title, clip_seq: hooks.clip_seq, event_seq: hooks.event_seq, progress: hooks.progress.clone(), kbd }
     }
 
     fn payload(&self, base: Option<&Snap>, new: &Snap) -> Vec<u8> {

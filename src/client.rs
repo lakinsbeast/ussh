@@ -267,12 +267,19 @@ fn run_remote(o: &Opts, args: &str) -> Result<i32, String> {
 }
 
 fn bootstrap(o: &Opts, cols: u16, rows: u16, batch: bool) -> Result<Boot, String> {
-    let colorterm = std::env::var("COLORTERM")
-        .ok()
-        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_alphanumeric()))
-        .unwrap_or_else(|| "-".into());
+    // Terminal identity for the remote shell: programs such as Claude Code
+    // pick their notification style by TERM_PROGRAM.
+    let env: Vec<String> = ["COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"]
+        .iter()
+        .filter_map(|k| {
+            let v = std::env::var(k).ok()?;
+            let ok = !v.is_empty() && v.len() <= 64 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b));
+            ok.then(|| format!("{k}={v}"))
+        })
+        .collect();
+    let env = if env.is_empty() { "-".to_string() } else { env.join(",") };
     let name = if o.auto { "@auto" } else { o.session.as_str() };
-    let args = format!("server connect {name} {cols} {rows} {colorterm}");
+    let args = format!("server connect {name} {cols} {rows} {env}");
     for _ in 0..2 {
         let mut child = ssh_command(o, batch)
             .arg(&o.host)

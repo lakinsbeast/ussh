@@ -27,6 +27,8 @@ pub struct Attrs {
     pub fgcolor: Color,
     pub bgcolor: Color,
     pub mode: u8,
+    /// OSC 8 hyperlink (see `crate::links`); 0 = none.
+    pub link: u16,
 }
 
 impl Default for Attrs {
@@ -41,6 +43,7 @@ impl Attrs {
             fgcolor: Color::Default,
             bgcolor: Color::Default,
             mode: 0,
+            link: 0,
         }
     }
 
@@ -120,46 +123,56 @@ impl Attrs {
         writer: &mut impl alloc::fmt::Write,
         other: &Self,
     ) -> alloc::fmt::Result {
-        if self != other && self == &Self::default() {
+        // SGR 0 doesn't end a hyperlink on real terminals, so links are
+        // diffed on their own.
+        if self.link != other.link {
+            crate::links::write_osc(writer, self.link)?;
+        }
+        let (this, other) =
+            (Self { link: 0, ..*self }, Self { link: 0, ..*other });
+        if this == other {
+            return Ok(());
+        }
+        if this == Self::default() {
             return crate::term::ClearAttrs.write_fmt(writer);
         }
 
         let attrs = crate::term::Attrs::default();
 
-        let attrs = if self.fgcolor == other.fgcolor {
+        let attrs = if this.fgcolor == other.fgcolor {
             attrs
         } else {
-            attrs.fgcolor(self.fgcolor)
+            attrs.fgcolor(this.fgcolor)
         };
-        let attrs = if self.bgcolor == other.bgcolor {
+        let attrs = if this.bgcolor == other.bgcolor {
             attrs
         } else {
-            attrs.bgcolor(self.bgcolor)
+            attrs.bgcolor(this.bgcolor)
         };
-        let attrs = if self.intensity() == other.intensity() {
+        let attrs = if this.intensity() == other.intensity() {
             attrs
         } else {
-            attrs.intensity(match self.intensity() {
+            attrs.intensity(match this.intensity() {
                 0 => crate::term::Intensity::Normal,
                 TEXT_MODE_BOLD => crate::term::Intensity::Bold,
                 TEXT_MODE_DIM => crate::term::Intensity::Dim,
                 _ => unreachable!(),
             })
         };
-        let attrs = if self.italic() == other.italic() {
+        let attrs = if this.italic() == other.italic() {
             attrs
         } else {
-            attrs.italic(self.italic())
+            attrs.italic(this.italic())
         };
-        let attrs = if self.underline() == other.underline() {
+        let attrs = if this.underline() == other.underline() {
             attrs
         } else {
-            attrs.underline(self.underline())
+            attrs.underline(this.underline())
         };
-        let attrs = if self.inverse() == other.inverse() {
+        let attrs = if this.inverse() == other.inverse() {
             attrs
         } else {
-            attrs.inverse(self.inverse())
+            attrs.inverse(this.inverse())
         };
 
         attrs.write_fmt(writer)

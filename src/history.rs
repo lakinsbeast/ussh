@@ -71,6 +71,10 @@ impl vt100::Callbacks for Hooks {
         }
         let mut fmt = String::new();
         let _ = row.write_formatted_basic(&mut fmt, &mut BasicFormattedCaptureState::new());
+        // Each line is printed on its own: don't let a hyperlink run past it.
+        if fmt.contains("\x1b]8;") {
+            fmt.push_str("\x1b]8;;\x07");
+        }
         let plain: String = basic_formatted_to_plain(&fmt).collect();
         if self.lines.len() >= HISTORY_CAP {
             self.lines.pop_front();
@@ -485,5 +489,24 @@ mod tests {
         assert_eq!(h.progress, "\x1b]9;4;1;42\x07");
         p.process(b"\x1b]9;4;0\x07");
         assert_eq!(p.callbacks().progress, "");
+    }
+
+    #[test]
+    fn hyperlinks() {
+        let mut p = vt100::Parser::new_with_callbacks(nz(3), nz(20), 0, Hooks::new());
+        p.process(b"a\x1b]8;id=1;http://x/?a=1;b=2\x1b\\li\x1b[mnk\x1b]8;;\x1b\\b\x1b[K");
+        let s = p.screen().clone();
+        let f = s.contents_formatted();
+        assert!(f.ends_with("a\x1b]8;id=1;http://x/?a=1;b=2\x07link\x1b]8;;\x07b"), "{f:?}");
+        // Erased cells don't get the link; the diff ends it again.
+        p.process(b"\r\n\x1b]8;;http://y\x07z\x1b[K");
+        let d = p.screen().contents_diff(&s);
+        assert!(d.contains("\x1b]8;;http://y\x07z\x1b]8;;\x07"), "{d:?}");
+        assert!(!d[d.find('z').unwrap()..].contains("http"), "{d:?}");
+        p.process(b"\x1b]8;;\x07\r\n\n\n");
+        let h = p.callbacks();
+        assert_eq!(h.lines[0].plain, "alinkb");
+        assert_eq!(h.lines[0].fmt, "a\x1b]8;id=1;http://x/?a=1;b=2\x07link\x1b]8;;\x07b\x1b]8;;\x07");
+        assert_eq!(h.lines[1].plain, "z");
     }
 }
