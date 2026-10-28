@@ -194,3 +194,80 @@ pub fn safe_name(name: &str) -> String {
     let s = s.trim_start_matches('.').to_string();
     if s.is_empty() { "file".into() } else { s.chars().take(120).collect() }
 }
+
+/// If pasted text is nothing but paths of existing local files (as terminals
+/// produce for Cmd+V or drag & drop from Finder: `\ `-escaped, quoted or
+/// `file://`), returns them.
+pub fn local_files(text: &str) -> Option<Vec<PathBuf>> {
+    let text = text.trim();
+    if text.is_empty() || text.len() > 16 * 1024 {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut files = Vec::new();
+    for word in shell_words(text)? {
+        let word = match word.strip_prefix("file://") {
+            Some(u) => percent_decode(u.strip_prefix("localhost").unwrap_or(u)),
+            None => word,
+        };
+        let path = match (word.strip_prefix("~/"), &home) {
+            (Some(rest), Some(h)) => h.join(rest),
+            _ => PathBuf::from(&word),
+        };
+        if !path.is_absolute() || !path.is_file() {
+            return None;
+        }
+        files.push(path);
+    }
+    (!files.is_empty()).then_some(files)
+}
+
+/// Splits like a shell: whitespace separates words; quotes and backslashes
+/// escape. None on an unterminated quote.
+fn shell_words(s: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => {
+                cur.push(it.next()?);
+                in_word = true;
+            }
+            '\'' => {
+                loop {
+                    match it.next()? {
+                        '\'' => break,
+                        c => cur.push(c),
+                    }
+                }
+                in_word = true;
+            }
+            '"' => {
+                loop {
+                    match it.next()? {
+                        '"' => break,
+                        '\\' => cur.push(it.next()?),
+                        c => cur.push(c),
+                    }
+                }
+                in_word = true;
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    Some(words)
+}

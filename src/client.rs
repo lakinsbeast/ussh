@@ -15,6 +15,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+const PASTE_MAX: usize = 64 * 1024;
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
 const USAGE: &str = "\
 usage: ussh [options] [user@]host
 
@@ -468,6 +476,8 @@ struct Client {
     status_until: Option<Instant>,
     /// Top-row notice, repainted over incoming frames while shown.
     status_text: Option<String>,
+    /// Inside a bracketed paste: what has arrived so far.
+    paste_buf: Option<Vec<u8>>,
     upload_started: Instant,
 }
 
@@ -566,6 +576,7 @@ fn run(o: Opts, boot: Boot) -> Result<String, String> {
         upload_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         status_until: None,
         status_text: None,
+        paste_buf: None,
         upload_started: now,
     };
     let ip = resolved.or(boot.server_ip);
@@ -771,7 +782,70 @@ impl Client {
         None
     }
 
+    /// Keyboard input, with bracketed pastes picked out: a paste that is only
+    /// local file paths (Cmd+V or drag & drop of files) becomes an upload.
     fn on_keys(&mut self, data: &[u8], now: Instant) -> Option<Exit> {
+        if let Some(p) = &mut self.paste_buf {
+            let old = p.len();
+            p.extend_from_slice(data);
+            let from = old.saturating_sub(PASTE_END.len() - 1);
+            let Some(k) = find(&p[from..], PASTE_END) else {
+                if p.len() > PASTE_MAX {
+                    // Too big to be a list of paths: pass it through as is.
+                    let p = self.paste_buf.take().unwrap();
+                    self.forward_paste(&[PASTE_START, &p].concat(), now);
+                }
+                return None;
+            };
+            let p = self.paste_buf.take().unwrap();
+            let end = from + k;
+            let rest = p[end + PASTE_END.len()..].to_vec();
+            if let Some(exit) = self.finish_paste(&p[..end], now) {
+                return Some(exit);
+            }
+            return self.on_keys(&rest, now);
+        }
+        match find(data, PASTE_START) {
+            None => self.keys_raw(data, now),
+            Some(k) => {
+                if let Some(exit) = self.keys_raw(&data[..k], now) {
+                    return Some(exit);
+                }
+                if self.paste_pending {
+                    self.held.extend_from_slice(&data[k..]);
+                    return None;
+                }
+                self.paste_buf = Some(Vec::new());
+                self.on_keys(&data[k + PASTE_START.len()..], now)
+            }
+        }
+    }
+
+    fn finish_paste(&mut self, content: &[u8], now: Instant) -> Option<Exit> {
+        let text = String::from_utf8_lossy(content);
+        if let Some(files) = crate::clipboard::local_files(&text) {
+            if self.start_upload(crate::clipboard::Clip::Files(files)) {
+                self.paste_pending = true;
+                return None;
+            }
+        }
+        self.forward_paste(&[PASTE_START, content, PASTE_END].concat(), now);
+        None
+    }
+
+    /// Pasted bytes go to the server verbatim (no Ctrl+V or Ctrl-^ handling).
+    fn forward_paste(&mut self, bytes: &[u8], now: Instant) {
+        for &b in bytes {
+            if b == ESC_BYTE {
+                self.input.extend_from_slice(&[ESC_BYTE, ESC_BYTE]);
+            } else {
+                self.input.push(b);
+            }
+        }
+        self.send(now);
+    }
+
+    fn keys_raw(&mut self, data: &[u8], now: Instant) -> Option<Exit> {
         for (i, &b) in data.iter().enumerate() {
             if self.paste_pending {
                 let pid = self.upload_pid.load(Ordering::SeqCst);
