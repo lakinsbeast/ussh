@@ -87,11 +87,12 @@ fn control(name: &str, cmd: &str) -> Result<String, String> {
 
 // ---------------------------------------------------------------- connect
 
-/// The session a plain `ussh host` gets: the most recently used `main` /
-/// `main-N` that no live client holds, or else a new one. Runs under a lock
-/// so that windows opened together don't pick the same session; the lock is
-/// held until the CONNECT, which marks the session taken.
-fn pick_session() -> Result<(String, std::fs::File), String> {
+/// The session a plain `ussh host` gets: `main`, or else the most recently
+/// used `main-N`, or else a new `main`. With `new` (`ussh -n`): the first
+/// free name of `main`, `main-2`, … Runs under a lock so that windows opened
+/// together don't make the same new session; the lock is held until the
+/// CONNECT, which creates it.
+fn pick_session(new: bool) -> Result<(String, std::fs::File), String> {
     let lock = std::fs::File::create(run_dir()?.join(".pick.lock")).map_err(|e| e.to_string())?;
     unsafe {
         libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX);
@@ -103,28 +104,41 @@ fn pick_session() -> Result<(String, std::fs::File), String> {
         .filter(|n| n == "main" || n.strip_prefix("main-").is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())))
         .collect();
     let states: Vec<(String, String)> = names.iter().map(|n| (n.clone(), control(n, "STATE").unwrap_or_default())).collect();
-    let mut free: Vec<(u64, String)> = states
-        .iter()
-        .filter_map(|(n, r)| Some((r.strip_prefix("OK free ")?.parse().ok()?, n.clone())))
-        .collect();
-    free.sort();
-    if let Some((_, n)) = free.into_iter().next() {
-        return Ok((n, lock));
-    }
     // A session on its way out frees its name (connect waits for it).
-    let taken = |n: &str| states.iter().any(|(x, r)| x == n && !r.starts_with("ERR ending"));
+    let taken = |n: &str| states.iter().any(|(x, r)| x == n && r.starts_with("OK "));
+    if !new {
+        if taken("main") {
+            return Ok(("main".to_string(), lock));
+        }
+        // Idle time; a session in use counts as just used.
+        let mut live: Vec<(u64, String)> = states
+            .iter()
+            .filter_map(|(n, r)| match r.as_str() {
+                "OK busy" => Some((0, n.clone())),
+                r => Some((r.strip_prefix("OK free ")?.parse().ok()?, n.clone())),
+            })
+            .collect();
+        live.sort();
+        if let Some((_, n)) = live.into_iter().next() {
+            return Ok((n, lock));
+        }
+    }
     let name = if !taken("main") { "main".to_string() } else { (2..).map(|i| format!("main-{i}")).find(|n| !taken(n)).unwrap() };
     Ok((name, lock))
 }
 
 fn connect(name: &str, cols: &str, rows: &str, env: &str) -> Result<(), String> {
-    let (name, lock) = if name == "@auto" {
-        let (n, l) = pick_session()?;
+    let (name, lock) = if name == "@auto" || name == "@new" {
+        let (n, l) = pick_session(name == "@new")?;
         (n, Some(l))
     } else {
         (name.to_string(), None)
     };
-    let name = name.as_str();
+    // `=NAME` (a client reconnecting): only an existing session will do.
+    let (name, reattach) = match name.strip_prefix('=') {
+        Some(n) => (n, true),
+        None => (name.as_str(), false),
+    };
     if !valid_name(name) {
         return Err(format!("bad session name {name:?}"));
     }
@@ -134,8 +148,10 @@ fn connect(name: &str, cols: &str, rows: &str, env: &str) -> Result<(), String> 
     let mut spawned = false;
     let reply = loop {
         match control(name, "CONNECT") {
+            Ok(r) if r.starts_with("ERR ending") && reattach => return gone(),
             Ok(r) if r.starts_with("ERR ending") => {}
             Ok(r) => break r,
+            Err(_) if reattach => return gone(),
             Err(e) if spawned && Instant::now() > deadline => return Err(format!("session did not start: {e}")),
             Err(_) if !spawned && UnixStream::connect(sock_path(name)?).is_err() => {
                 spawn_session(name, cols, rows, env)?;
@@ -168,6 +184,12 @@ fn connect(name: &str, cols: &str, rows: &str, env: &str) -> Result<(), String> 
     out.flush().map_err(|e| e.to_string())?;
     drop(out);
     relay(port)
+}
+
+/// Tells a reconnecting client its session has ended.
+fn gone() -> Result<(), String> {
+    println!("USSH_GONE");
+    Ok(())
 }
 
 /// Forward length-prefixed packets between stdio (the SSH channel) and the

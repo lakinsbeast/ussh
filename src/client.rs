@@ -1,6 +1,6 @@
-//! Client: bootstraps over SSH, then talks to the session over UDP, falling
-//! back to the SSH channel (the server-side relay) when UDP doesn't get
-//! through. Reconnects SSH by itself when everything goes quiet.
+//! Client: bootstraps over SSH, then talks to the session over UDP and the
+//! SSH channel (the server-side relay) at once, so a lossy UDP path costs
+//! nothing. Reconnects SSH by itself when everything goes quiet.
 
 use crate::crypto::{self, Keys, DIR_TO_CLIENT};
 use crate::proto::{self, ClientMsg, FileAck, FileChunk, ServerMsg, ESC_BYTE, FLAG_ENDED, FLAG_SUPERSEDED, MAX_INPUT_CHUNK};
@@ -46,8 +46,9 @@ usage: ussh [options] [user@]host
 
 options:
   -s, --session NAME   attach this session (taking it over from another
-                       window) or create it. Default: the last main/main-N
-                       no window is using, or a new main-N
+                       window) or create it. Default: main, or the last
+                       used main-N if there is no main
+  -n, --new            start a new session (main-2, main-3, …)
   --ssh CMD            ssh command to use, e.g. --ssh=\"ssh -p 2222\"
   -l, --list           list sessions on host
   --kill               end the session on host
@@ -63,8 +64,10 @@ keys (Ctrl-^ is Ctrl-6 / Ctrl-Shift-6 on most keyboards):
 struct Opts {
     host: String,
     session: String,
-    /// No -s: let the server pick a free session.
+    /// No -s: let the server pick the existing session.
     auto: bool,
+    /// -n: let the server start a new session.
+    new: bool,
     ssh: Vec<String>,
 }
 
@@ -72,6 +75,7 @@ pub fn main(args: &[String]) -> i32 {
     let mut host = None;
     let mut session = "main".to_string();
     let mut auto = true;
+    let mut new = false;
     let mut ssh = std::env::var("USSH_SSH").unwrap_or_else(|_| "ssh".into());
     let (mut list, mut kill) = (false, false);
     let mut it = args.iter();
@@ -85,6 +89,7 @@ pub fn main(args: &[String]) -> i32 {
                 session = it.next().cloned().unwrap_or_default();
                 auto = false;
             }
+            "-n" | "--new" => new = true,
             "--ssh" => ssh = it.next().cloned().unwrap_or_default(),
             "-l" | "--list" => list = true,
             "--kill" => kill = true,
@@ -109,7 +114,11 @@ pub fn main(args: &[String]) -> i32 {
         eprintln!("ussh: empty --ssh");
         return 2;
     }
-    let mut o = Opts { host, session, auto, ssh };
+    if new && !auto {
+        eprintln!("ussh: -n and -s don't go together");
+        return 2;
+    }
+    let mut o = Opts { host, session, auto, new, ssh };
     if let Some(home) = std::env::var_os("HOME") {
         let _ = std::fs::create_dir_all(std::path::Path::new(&home).join(".ussh"));
     }
@@ -135,9 +144,10 @@ pub fn main(args: &[String]) -> i32 {
         }
     };
     // Reconnects must come back to this very session.
-    let picked = o.auto && boot.session != "main";
+    let picked = o.new;
     o.session = boot.session.clone();
     o.auto = false;
+    o.new = false;
     let msg = match run(o, boot, picked) {
         Ok(m) => m,
         Err(e) => format!("error: {e}"),
@@ -267,6 +277,9 @@ fn run_remote(o: &Opts, args: &str) -> Result<i32, String> {
     Err("install did not take effect".into())
 }
 
+/// The server's answer to a reconnect when the session no longer exists.
+const GONE: &str = "USSH_GONE";
+
 fn bootstrap(o: &Opts, cols: u16, rows: u16, batch: bool) -> Result<Boot, String> {
     // Terminal identity for the remote shell: programs such as Claude Code
     // pick their notification style by TERM_PROGRAM.
@@ -279,7 +292,17 @@ fn bootstrap(o: &Opts, cols: u16, rows: u16, batch: bool) -> Result<Boot, String
         })
         .collect();
     let env = if env.is_empty() { "-".to_string() } else { env.join(",") };
-    let name = if o.auto { "@auto" } else { o.session.as_str() };
+    // A reconnect only reattaches: if the session is gone, a fresh one in
+    // its place would not match the screen we have.
+    let name = if o.new {
+        "@new".to_string()
+    } else if o.auto {
+        "@auto".to_string()
+    } else if batch {
+        format!("={}", o.session)
+    } else {
+        o.session.clone()
+    };
     let args = format!("server connect {name} {cols} {rows} {env}");
     for _ in 0..2 {
         let mut child = ssh_command(o, batch)
@@ -294,6 +317,10 @@ fn bootstrap(o: &Opts, cols: u16, rows: u16, batch: bool) -> Result<Boot, String
         let mut line = String::new();
         let _ = stdout.read_line(&mut line);
         let line = line.trim();
+        if line == GONE {
+            let _ = child.wait();
+            return Err(GONE.into());
+        }
         if let Some(p) = line.strip_prefix("USSH_NEED_INSTALL ") {
             let _ = child.wait();
             if batch {
@@ -418,7 +445,6 @@ struct Relay {
     id: u64,
     child: Child,
     tx: mpsc::SyncSender<Vec<u8>>,
-    started: Instant,
 }
 
 impl Drop for Relay {
@@ -629,6 +655,8 @@ struct Assembly {
 /// (drop everything while that file exists).
 struct Knobs {
     drop: f64,
+    /// Share of UDP packets from the server to drop (a lossy UDP path).
+    udp_drop: f64,
     no_udp: bool,
     roam: Option<Duration>,
     blackhole: Option<std::path::PathBuf>,
@@ -640,6 +668,7 @@ impl Knobs {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         Knobs {
             drop: var("USSH_DROP").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            udp_drop: var("USSH_UDP_DROP").and_then(|v| v.parse().ok()).unwrap_or(0.0),
             no_udp: var("USSH_NO_UDP").is_some(),
             roam: var("USSH_ROAM_SECS").and_then(|v| v.parse().ok()).map(Duration::from_secs_f64),
             blackhole: var("USSH_BLACKHOLE").map(Into::into),
@@ -651,13 +680,23 @@ impl Knobs {
         if self.blackhole.as_ref().is_some_and(|p| p.exists()) {
             return true;
         }
-        if self.drop <= 0.0 {
+        let p = self.drop;
+        self.chance(p)
+    }
+
+    fn lose_udp(&mut self) -> bool {
+        let p = self.udp_drop;
+        self.chance(p)
+    }
+
+    fn chance(&mut self, p: f64) -> bool {
+        if p <= 0.0 {
             return false;
         }
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
-        ((self.rng >> 11) as f64 / (1u64 << 53) as f64) < self.drop
+        ((self.rng >> 11) as f64 / (1u64 << 53) as f64) < p
     }
 }
 
@@ -689,7 +728,6 @@ struct Client {
     prefix: bool,
 
     last_recv: Instant,
-    last_udp: Option<Instant>,
     last_send: Instant,
     last_input_send: Instant,
     reconnecting: bool,
@@ -805,7 +843,6 @@ fn run(o: Opts, boot: Boot, picked: bool) -> Result<String, String> {
         rows,
         prefix: false,
         last_recv: now,
-        last_udp: None,
         last_send: now,
         last_input_send: now,
         reconnecting: false,
@@ -838,7 +875,7 @@ fn run(o: Opts, boot: Boot, picked: bool) -> Result<String, String> {
     c.rebind_udp();
     c.send(Instant::now());
     if picked {
-        let text = format!("ussh: session {} (main is open in another window; ussh --list shows all)", c.o.session);
+        let text = format!("ussh: new session {} (ussh --list shows all)", c.o.session);
         c.status(&text, Duration::from_secs(4));
     }
 
@@ -930,7 +967,7 @@ impl Client {
             }
             let _ = tx.send(Ev::RelayDead(id));
         });
-        self.relay = Some(Relay { id, child: boot.child, tx: rtx, started: Instant::now() });
+        self.relay = Some(Relay { id, child: boot.child, tx: rtx });
     }
 
     fn rebind_udp(&mut self) {
@@ -973,10 +1010,11 @@ impl Client {
             }
             Ev::Net(wire, via_udp) => return self.on_packet(&wire, via_udp, now),
             Ev::RelayDead(id) => {
+                // The relay is the reliable path: get a new one at once (UDP
+                // that seems to work may still be losing most packets).
                 if self.relay.as_ref().is_some_and(|r| r.id == id) {
                     self.relay = None;
-                    let udp_ok = self.last_udp.is_some_and(|t| now.duration_since(t) < Duration::from_secs(2));
-                    if !udp_ok && !self.reconnecting {
+                    if !self.reconnecting {
                         self.next_reconnect = self.next_reconnect.min(now);
                     }
                 }
@@ -1011,8 +1049,12 @@ impl Client {
                         self.adopt(*boot);
                         self.backoff = Duration::from_secs(1);
                         self.last_error.clear();
+                        // Give the new credentials time for a first reply
+                        // before deciding they don't work either.
+                        self.next_reconnect = now + Duration::from_secs(3);
                         self.send(now);
                     }
+                    Err(e) if e == GONE => return Some(Exit::Ended),
                     Err(e) => {
                         self.last_error = e;
                         self.next_reconnect = now + self.backoff;
@@ -1257,7 +1299,7 @@ impl Client {
     }
 
     fn on_packet(&mut self, wire: &[u8], via_udp: bool, now: Instant) -> Option<Exit> {
-        if self.knobs.lose() {
+        if self.knobs.lose() || (via_udp && self.knobs.lose_udp()) {
             return None;
         }
         let hdr = crypto::peek_header(&self.mask, wire)?;
@@ -1274,9 +1316,6 @@ impl Client {
 
         self.last_recv = now;
         self.server_files = msg.files;
-        if via_udp {
-            self.last_udp = Some(now);
-        }
         self.backoff = Duration::from_secs(1);
         let mut reply = false;
         if self.overlay_drawn.take().is_some() {
@@ -1286,7 +1325,8 @@ impl Client {
         if msg.flags & FLAG_ENDED != 0 {
             return Some(Exit::Ended);
         }
-        if msg.flags & FLAG_SUPERSEDED != 0 {
+        // (Our own reconnect supersedes these credentials too.)
+        if msg.flags & FLAG_SUPERSEDED != 0 && !self.reconnecting {
             return Some(Exit::Superseded);
         }
         if msg.input_ack > self.input_base {
@@ -1640,14 +1680,12 @@ impl Client {
             self.send(now);
         }
 
-        // UDP works: drop the SSH relay (after a grace period, to avoid flapping).
-        let udp_fresh = self.last_udp.is_some_and(|t| now.duration_since(t) < Duration::from_secs(1));
-        if udp_fresh && self.relay.as_ref().is_some_and(|r| now.duration_since(r.started) > Duration::from_secs(2)) {
-            self.relay = None;
-        }
-
+        // The SSH relay stays up next to UDP: some networks pass the first
+        // seconds of a UDP flow and then drop most of it, which looks like
+        // working UDP. Every packet goes both ways; duplicates are harmless.
         let silent = now.duration_since(self.last_recv);
-        if silent > Duration::from_secs(5) && !self.reconnecting && now >= self.next_reconnect {
+        let relay_lost = self.relay.is_none() && self.relay_ids > 0;
+        if (silent > Duration::from_secs(5) || relay_lost) && !self.reconnecting && now >= self.next_reconnect {
             self.reconnecting = true;
             let (o, tx, cols, rows) = (self.o.clone(), self.tx.clone(), self.cols, self.rows);
             std::thread::spawn(move || {
