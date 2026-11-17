@@ -245,6 +245,12 @@ impl Gfx {
         }
         let (ctrl, payload) = split_cmd(body);
         let keys = Keys::parse(ctrl);
+        // A capability probe: answer it before loading anything. It may name a
+        // medium, and answering after `load` used to read (and delete) the file.
+        if keys.ch(b'a') == Some(b'q') {
+            respond(&keys, keys.num(b'i'), "OK", &mut fx);
+            return fx;
+        }
         // Each chunk is base64 on its own (some programs pad every chunk).
         let decoded = b64decode(payload);
         if let Some((_, data)) = &mut self.chunked {
@@ -280,7 +286,8 @@ impl Gfx {
 
     fn run(&mut self, k: &Keys, payload: &[u8], screen: &vt100::Screen, fx: &mut Effect) {
         match k.ch(b'a').unwrap_or(b't') {
-            b't' | b'T' | b'q' => self.transmit(k, payload, screen, fx),
+            b't' | b'T' => self.transmit(k, payload, screen, fx),
+            b'q' => respond(k, k.num(b'i'), "OK", fx),
             b'p' => match self.find(k) {
                 Some(id) => {
                     respond(k, id, "OK", fx);
@@ -320,9 +327,6 @@ impl Gfx {
         let Some(px) = px else {
             return respond(k, 0, "EINVAL:bad image data", fx);
         };
-        if k.ch(b'a') == Some(b'q') {
-            return respond(k, k.num(b'i'), "OK", fx);
-        }
         let id = match k.num(b'i') {
             0 => self.auto_id(),
             i => i,
@@ -506,7 +510,7 @@ fn load(k: &Keys, payload: &[u8]) -> Result<Vec<u8>, String> {
         let name = String::from_utf8(raw).map_err(|_| "EINVAL:bad path")?;
         let path = match medium {
             b'f' | b't' => std::path::PathBuf::from(&name),
-            b's' => std::path::Path::new("/dev/shm").join(name.trim_start_matches('/')),
+            b's' => shm_path(&name)?,
             _ => return Err("EINVAL:bad transmission medium".into()),
         };
         let meta = std::fs::metadata(&path).map_err(|e| format!("ENOENT:{e}"))?;
@@ -516,11 +520,14 @@ fn load(k: &Keys, payload: &[u8]) -> Result<Vec<u8>, String> {
         let mut f = std::fs::File::open(&path).map_err(|e| format!("EBADF:{e}"))?;
         let (off, size) = (k.num(b'O') as u64, k.num(b'S') as u64);
         std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(off)).map_err(|e| format!("EBADF:{e}"))?;
-        let limit = if size > 0 { size } else { MAX_IMAGE as u64 + 1 };
+        // `S=0` means "to the end", and neither form may read past one image:
+        // `S` is a `u32` from the program, so trusting it means a 4 GB read.
+        let limit = if size == 0 { MAX_IMAGE as u64 + 1 } else { size.min(MAX_IMAGE as u64 + 1) };
         let mut data = Vec::new();
         f.take(limit).read_to_end(&mut data).map_err(|e| format!("EBADF:{e}"))?;
-        // Temp files and shared memory are the terminal's to remove.
-        if medium == b's' || (medium == b't' && name.contains("tty-graphics-protocol")) {
+        // Temp files and shared memory are the terminal's to remove — but only
+        // ones that really look like it, or a program could name any file.
+        if medium == b's' || (medium == b't' && terminal_temp(&path)) {
             let _ = std::fs::remove_file(&path);
         }
         data
@@ -539,6 +546,33 @@ fn load(k: &Keys, payload: &[u8]) -> Result<Vec<u8>, String> {
         return Err("EFBIG:image too big".into());
     }
     Ok(data)
+}
+
+/// `/dev/shm/<name>` with `..` resolved and confined to `/dev/shm`. The name is
+/// a program's string: `join` alone lets `../../` escape the directory.
+fn shm_path(name: &str) -> Result<std::path::PathBuf, String> {
+    let p = std::path::Path::new("/dev/shm").join(name.trim_start_matches('/'));
+    let canon = p.canonicalize().map_err(|e| format!("ENOENT:{e}"))?;
+    if !canon.starts_with("/dev/shm") {
+        return Err("EINVAL:bad path".into());
+    }
+    Ok(canon)
+}
+
+/// A terminal's own temp file (`t=t`). Anything else must not be deleted just
+/// because a program named it, and the name alone is not enough: it has to sit
+/// in a temp directory too.
+fn terminal_temp(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return false };
+    if !name.starts_with("tty-graphics-protocol") {
+        return false;
+    }
+    let Some(dir) = path.parent() else { return false };
+    // $TMPDIR on macOS comes with a trailing slash; compare without it.
+    let tmp = std::env::temp_dir();
+    let tmp = tmp.to_string_lossy();
+    let tmp = std::path::Path::new(tmp.trim_end_matches('/'));
+    dir == tmp || dir == std::path::Path::new("/tmp") || dir == std::path::Path::new("/dev/shm")
 }
 
 fn png_size(d: &[u8]) -> Option<(u32, u32)> {
@@ -923,6 +957,36 @@ mod tests {
         st.ack(5, Instant::now());
         assert_eq!(st.slice(5, 2), vec![6, 7]);
         assert_eq!(st.slice(9, 2), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn shm_names_cannot_escape_dev_shm() {
+        // `t=s` names come from the program: `..` used to resolve anywhere.
+        assert!(shm_path("../../etc/passwd").is_err());
+        assert!(shm_path("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn only_terminal_temp_files_are_removed() {
+        assert!(terminal_temp(std::path::Path::new("/tmp/tty-graphics-protocol-1")));
+        assert!(!terminal_temp(std::path::Path::new("/home/u/tty-graphics-protocol-1")));
+        assert!(!terminal_temp(std::path::Path::new("/tmp/notes.txt")));
+        assert!(!terminal_temp(std::path::Path::new("/tmp/x-tty-graphics-protocol")));
+    }
+
+    #[test]
+    fn size_parameter_cannot_exceed_one_image() {
+        // `S` is a u32 from the program: the read must stop at MAX_IMAGE.
+        let dir = std::env::temp_dir().join(format!("ussh-size-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("sparse.bin");
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(MAX_IMAGE as u64 * 2).unwrap();
+        drop(f);
+        let k = Keys::parse(format!("a=T,t=f,S={};", MAX_IMAGE * 2).as_bytes());
+        let got = load(&k, p.to_str().unwrap().as_bytes());
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(got.is_err(), "a huge S must not read past one image");
     }
 
     #[test]
