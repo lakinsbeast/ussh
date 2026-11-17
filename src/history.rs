@@ -375,13 +375,16 @@ impl Viewer {
                 b"n" => self.search(hooks, live, rows, true),
                 b"N" => self.search(hooks, live, rows, false),
                 k if k.starts_with(b"\x1b[<") => {
-                    // SGR mouse: wheel up = 64, wheel down = 65.
-                    let body = &k[3..k.len() - 1];
-                    let btn = body.split(|&c| c == b';').next().unwrap_or(b"");
-                    match btn {
-                        b"64" => self.scroll(hooks, live, rows, -3),
-                        b"65" => self.scroll(hooks, live, rows, 3),
-                        _ => {}
+                    // SGR mouse: wheel up = 64, wheel down = 65. `esc_len` gives
+                    // back the whole buffer for an unfinished CSI (input arrives
+                    // in 1 KB chunks), so `k` can be exactly "\x1b[<": no body.
+                    if let Some(body) = k.get(3..k.len().saturating_sub(1)) {
+                        let btn = body.split(|&c| c == b';').next().unwrap_or(b"");
+                        match btn {
+                            b"64" => self.scroll(hooks, live, rows, -3),
+                            b"65" => self.scroll(hooks, live, rows, 3),
+                            _ => {}
+                        }
                     }
                 }
                 _ => {}
@@ -489,6 +492,18 @@ mod tests {
         assert_eq!(h.progress, "\x1b]9;4;1;42\x07");
         p.process(b"\x1b]9;4;0\x07");
         assert_eq!(p.callbacks().progress, "");
+    }
+
+    #[test]
+    fn unfinished_sgr_mouse_does_not_panic() {
+        // Input arrives in 1000-byte chunks, so the escape can be cut anywhere,
+        // including right after "\x1b[<"; the viewer must not slice past the end.
+        let mut v = Viewer::new(5, 20);
+        let hooks = Hooks::new();
+        let p = vt100::Parser::new(nz(5), nz(20), 0);
+        for k in [b"\x1b[<".as_slice(), b"\x1b[<64;1", b"\x1b[<64;1;2M"] {
+            assert!(matches!(v.keys(k, &hooks, p.screen(), 5), KeyResult::Stay));
+        }
     }
 
     #[test]
