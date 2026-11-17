@@ -175,17 +175,24 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        // Byte-wise: `&s[i + 1..i + 3]` panics when a multi-byte character
+        // follows `%` (a file named "100%€.png" is enough).
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(hi), Some(lo)) = (hex_digit(b[i + 1]), hex_digit(b[i + 2]))
+        {
+            out.push(hi << 4 | lo);
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(c: u8) -> Option<u8> {
+    (c as char).to_digit(16).map(|d| d as u8)
 }
 
 /// A remote-safe file name: letters, digits, `.`, `-`, `_` only.
@@ -270,4 +277,27 @@ fn shell_words(s: &str) -> Option<Vec<String>> {
         words.push(cur);
     }
     Some(words)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_decode_cuts_bytes_not_chars() {
+        // Used to panic: the slice ended inside the multi-byte character.
+        assert_eq!(percent_decode("100%€"), "100%€");
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("%2F%2ftmp"), "//tmp");
+        // An incomplete escape stays as it is.
+        assert_eq!(percent_decode("100%2"), "100%2");
+        assert_eq!(percent_decode("100%zz"), "100%zz");
+    }
+
+    #[test]
+    fn safe_name_keeps_plain_names() {
+        assert_eq!(safe_name("../etc/passwd"), "_etc_passwd");
+        assert_eq!(safe_name(".hidden"), "hidden");
+        assert_eq!(safe_name(""), "file");
+    }
 }
