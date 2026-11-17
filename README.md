@@ -1,5 +1,7 @@
 # ussh
 
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Удалённый шелл в духе mosh: соединение переживает обрывы и смену сети, сессия живёт на сервере, а история прокручивается и ищется.
 
 ## Установка
@@ -128,3 +130,7 @@ Claude Code выбирает способ уведомлять по `TERM_PROGRA
 Клиент вшивает в себя серверные бинарники (`USSH_EMBED_DIR`, см. `build.rs`). Клиент под Mac сам ставит на сервер Linux-версию нужной архитектуры: выбор по `uname -sm`, а проверка по FNV-хешу бинарника (`ussh build-id`).
 
 Отладочный лог: клиент — `USSH_LOG=/path`, сервер — если существует `~/.ussh/debug`, пишет в `~/.ussh/run/NAME.debug`.
+
+## Лицензия
+
+MIT, см. [LICENSE](LICENSE). Вендорная копия `vt100` в `vendor/vt100` — тоже MIT (Jesse Luehrs).
