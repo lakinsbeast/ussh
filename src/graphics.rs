@@ -990,6 +990,76 @@ mod tests {
     }
 
     #[test]
+    fn probe_answers_without_read_or_delete() {
+        // `a=q` may name a medium: it has to be answered before anything is
+        // loaded, or a probe reads (and deletes) the file it points at.
+        let dir = std::env::temp_dir().join(format!("ussh-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("keep.bin");
+        std::fs::write(&plain, [1u8, 2, 3]).unwrap();
+        let marked = dir.join("notes-tty-graphics-protocol.txt");
+        std::fs::write(&marked, b"keep me").unwrap();
+        let mut g = Gfx::new(Instant::now());
+        g.enabled = true;
+        let scr = vt100::Parser::new(crate::history::nz(5), crate::history::nz(20), 0);
+        for (medium, path) in [("t=f", &plain), ("t=t", &marked), ("t=s", &marked)] {
+            // An id is required for the terminal to answer at all.
+            let cmd = [format!("a=q,i=1,{medium};").into_bytes(), b64encode(path.to_str().unwrap().as_bytes())].concat();
+            let reply = String::from_utf8_lossy(&g.command(&cmd, scr.screen()).reply).into_owned();
+            assert!(reply.contains("OK"), "{medium}: {reply:?}");
+        }
+        assert!(plain.exists() && marked.exists(), "a probe must not delete what it names");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn marker_name_outside_temp_is_not_deleted() {
+        // "notes-tty-graphics-protocol.txt" used to be read and removed.
+        let dir = std::env::temp_dir().join(format!("ussh-tt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("notes-tty-graphics-protocol.txt");
+        std::fs::write(&p, b"keep me").unwrap();
+        let mut g = Gfx::new(Instant::now());
+        g.enabled = true;
+        let scr = vt100::Parser::new(crate::history::nz(5), crate::history::nz(20), 0);
+        let cmd = [b"a=T,i=1,t=t,f=32,s=1,v=1;".as_slice(), &b64encode(p.to_str().unwrap().as_bytes())].concat();
+        let _ = g.command(&cmd, scr.screen());
+        assert!(p.exists(), "only the terminal's own temp file may be removed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shm_traversal_is_refused_through_a_command() {
+        // The real APC command, not just the helper.
+        let mut g = Gfx::new(Instant::now());
+        g.enabled = true;
+        let scr = vt100::Parser::new(crate::history::nz(5), crate::history::nz(20), 0);
+        let cmd = [b"a=T,i=1,t=s,f=32,s=1,v=1;".as_slice(), &b64encode(b"../../etc/passwd")].concat();
+        let reply = String::from_utf8_lossy(&g.command(&cmd, scr.screen()).reply).into_owned();
+        assert!(reply.contains("EINVAL") || reply.contains("ENOENT"), "{reply:?}");
+    }
+
+    /// Linux only: on macOS there is no /dev/shm, so the old code failed with
+    /// ENOENT before it could reach (and delete) the file. Here the escape has
+    /// a real victim the user owns, which is what makes the test discriminate.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shm_traversal_cannot_delete_outside_files() {
+        let victim = std::env::temp_dir().join(format!("ussh-victim-{}", std::process::id()));
+        std::fs::write(&victim, b"keep me").unwrap();
+        // From /dev/shm: "../../../tmp/<victim>" resolves to /tmp/<victim>.
+        let name = format!("../../../tmp/{}", victim.file_name().unwrap().to_str().unwrap());
+        let mut g = Gfx::new(Instant::now());
+        g.enabled = true;
+        let scr = vt100::Parser::new(crate::history::nz(5), crate::history::nz(20), 0);
+        let cmd = [b"a=T,i=1,t=s,f=32,s=1,v=1;".as_slice(), &b64encode(name.as_bytes())].concat();
+        let reply = String::from_utf8_lossy(&g.command(&cmd, scr.screen()).reply).into_owned();
+        let survived = victim.exists();
+        std::fs::remove_file(&victim).ok();
+        assert!(survived, "a path outside /dev/shm must not be read or deleted: {reply:?}");
+    }
+
+    #[test]
     fn sink_records() {
         let mut sink = Sink::default();
         let mut r = record("a=t,i=1", b"hi");

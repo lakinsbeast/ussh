@@ -295,6 +295,18 @@ mod tests {
     }
 
     #[test]
+    fn local_files_survives_percent_names() {
+        // The real drag-and-drop path: a file:// URI with "%" before "€".
+        let dir = std::env::temp_dir().join(format!("ussh-pct-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("100%€.png");
+        std::fs::write(&p, b"x").unwrap();
+        let got = local_files(&format!("file://{}", p.to_str().unwrap()));
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(got.is_some_and(|f| f == vec![p]), "a dropped file must survive");
+    }
+
+    #[test]
     fn safe_name_keeps_plain_names() {
         assert_eq!(safe_name("../etc/passwd"), "_etc_passwd");
         assert_eq!(safe_name(".hidden"), "hidden");
