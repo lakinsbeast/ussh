@@ -43,6 +43,7 @@ pub fn main(args: &[String]) -> i32 {
         Some("session") if args.len() >= 5 => run_session(&args[1], &args[2], &args[3], &args[4]),
         Some("list") => list(),
         Some("kill") if args.len() >= 2 => kill(&args[1]),
+        Some("clean") => clean(args.get(1).and_then(|d| d.parse().ok()).unwrap_or(7)),
         Some("dump") if args.len() >= 2 => control(&args[1], "DUMP").map(|r| {
             let hex = r.strip_prefix("OK ").unwrap_or("");
             let bytes: Vec<u8> = (0..hex.len() / 2).filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()).collect();
@@ -128,6 +129,7 @@ fn pick_session(new: bool) -> Result<(String, std::fs::File), String> {
 }
 
 fn connect(name: &str, cols: &str, rows: &str, env: &str) -> Result<(), String> {
+    maybe_daily_clean();
     let (name, lock) = if name == "@auto" || name == "@new" {
         let (n, l) = pick_session(name == "@new")?;
         (n, Some(l))
@@ -291,6 +293,75 @@ fn list() -> Result<(), String> {
 
 fn kill(name: &str) -> Result<(), String> {
     control(name, "KILL").map(|r| println!("{r}"))
+}
+/// Ends sessions nobody has been attached to for the given number of days,
+/// and clears sockets whose process is gone. Attached sessions are never
+/// touched, however old.
+fn clean(days: u64) -> Result<(), String> {
+    let dir = run_dir()?;
+    let max_ms = days.saturating_mul(24 * 3600 * 1000);
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.strip_suffix(".sock").map(str::to_string))
+        .collect();
+    names.sort();
+    let mut ended = 0;
+    for n in names {
+        let sock = dir.join(format!("{n}.sock"));
+        // A session that never had a client reports u64::MAX, so the age of
+        // its socket file is the best evidence of how long it has sat there.
+        let age_ms = std::fs::metadata(&sock)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map_or(u64::MAX, |d| d.as_millis() as u64);
+        match control(&n, "STATE") {
+            Ok(state) => {
+                let idle = state
+                    .strip_prefix("OK free ")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map(|ms| ms.min(age_ms));
+                if let Some(ms) = idle.filter(|ms| *ms > max_ms) {
+                    let _ = control(&n, "KILL");
+                    println!("{n}: idle {}d, ended", ms / 86_400_000);
+                    ended += 1;
+                }
+            }
+            Err(_) => {
+                // Nothing listens on it any more.
+                let _ = std::fs::remove_file(&sock);
+                let _ = std::fs::remove_dir_all(dir.join(format!("{n}.files")));
+            }
+        }
+    }
+    if ended == 0 {
+        println!("nothing idle for {days}d");
+    }
+    Ok(())
+}
+
+/// Runs the cleanup at most once a day, detached: connecting must not wait
+/// for it, and sessions pile up silently otherwise.
+fn maybe_daily_clean() {
+    let Ok(dir) = run_dir() else { return };
+    let stamp = dir.join(".last-clean");
+    let due = std::fs::metadata(&stamp)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map_or(true, |d| d > Duration::from_secs(24 * 3600));
+    // Stamp first, so two connects at once do not both start a cleanup.
+    if !due || std::fs::write(&stamp, b"").is_err() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    let _ = Command::new(exe)
+        .args(["server", "clean", "7"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 // ---------------------------------------------------------------- session

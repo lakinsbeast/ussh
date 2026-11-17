@@ -46,17 +46,19 @@ usage: ussh [options] [user@]host
 
 options:
   -s, --session NAME   attach this session (taking it over from another
-                       window) or create it. Default: main, or the last
-                       used main-N if there is no main
-  -n, --new            start a new session (main-2, main-3, …)
+                       window) or create it
+  -n, --new            start a new session (the default)
   --ssh CMD            ssh command to use, e.g. --ssh=\"ssh -p 2222\"
   -l, --list           list sessions on host
   --kill               end the session on host
+  --clean[=DAYS]       end sessions idle longer than DAYS (default 7); this
+                       also runs by itself once a day
   -V, --version
 
 keys (Ctrl-^ is Ctrl-6 / Ctrl-Shift-6 on most keyboards):
   Ctrl-^ .             detach (the session keeps running)
   Ctrl-^ h             history viewer: scroll and / search
+  Ctrl-^ ?             this help over the screen
   Ctrl-^ Ctrl-^        send a literal Ctrl-^
 ";
 
@@ -78,6 +80,10 @@ pub fn main(args: &[String]) -> i32 {
     let mut new = false;
     let mut ssh = std::env::var("USSH_SSH").unwrap_or_else(|_| "ssh".into());
     let (mut list, mut kill) = (false, false);
+    let mut clean: Option<u64> = None;
+    // -n and -s are only contradictory when both were typed: a plain
+    // "ussh host" now means a new session, which sets neither.
+    let (mut explicit_new, mut explicit_session) = (false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -88,11 +94,17 @@ pub fn main(args: &[String]) -> i32 {
             "-s" | "--session" => {
                 session = it.next().cloned().unwrap_or_default();
                 auto = false;
+                explicit_session = true;
             }
-            "-n" | "--new" => new = true,
+            "-n" | "--new" => {
+                new = true;
+                explicit_new = true;
+            }
             "--ssh" => ssh = it.next().cloned().unwrap_or_default(),
             "-l" | "--list" => list = true,
             "--kill" => kill = true,
+            "--clean" => clean = Some(7),
+            s if s.starts_with("--clean=") => clean = Some(s["--clean=".len()..].parse().unwrap_or(7)),
             s if s.starts_with("--ssh=") => ssh = s["--ssh=".len()..].to_string(),
             s if s.starts_with('-') => {
                 eprintln!("ussh: unknown option {s}\n\n{USAGE}");
@@ -118,13 +130,25 @@ pub fn main(args: &[String]) -> i32 {
         eprintln!("ussh: -n and -s don't go together");
         return 2;
     }
+    // Plain "ussh host" opens a fresh session (main, main-2, ...): sharing one
+    // screen by accident is worse than one extra session. -s NAME is how you
+    // come back to one that already runs.
+    if !explicit_session && !explicit_new {
+        new = true;
+    }
     let mut o = Opts { host, session, auto, new, ssh };
     if let Some(home) = std::env::var_os("HOME") {
         let _ = std::fs::create_dir_all(std::path::Path::new(&home).join(".ussh"));
     }
 
-    if list || kill {
-        let cmd = if list { "server list".to_string() } else { format!("server kill {}", o.session) };
+    if list || kill || clean.is_some() {
+        let cmd = if list {
+            "server list".to_string()
+        } else if kill {
+            format!("server kill {}", o.session)
+        } else {
+            format!("server clean {}", clean.unwrap_or(7))
+        };
         return match run_remote(&o, &cmd) {
             Ok(code) => code,
             Err(e) => {
@@ -762,6 +786,8 @@ struct Client {
     /// Inside a bracketed paste: what has arrived so far.
     paste_buf: Option<Vec<u8>>,
     upload_started: Instant,
+    /// The key map is being shown over the screen.
+    help: bool,
 }
 
 enum Exit {
@@ -868,6 +894,7 @@ fn run(o: Opts, boot: Boot, picked: bool) -> Result<String, String> {
         status_text: None,
         paste_buf: None,
         upload_started: now,
+        help: false,
     };
     let ip = resolved.or(boot.server_ip);
     c.server = ip.map(|ip| SocketAddr::new(ip, boot.port));
@@ -1211,6 +1238,12 @@ impl Client {
     }
 
     fn keys_raw(&mut self, data: &[u8], now: Instant) -> Option<Exit> {
+        if self.help {
+            // The key that closes the help is swallowed, not passed on.
+            self.help = false;
+            self.redraw_local();
+            return None;
+        }
         let mut i = 0;
         while i < data.len() {
             let (b, len) = match self.own_key(&data[i..]) {
@@ -1264,6 +1297,10 @@ impl Client {
             if self.prefix {
                 self.prefix = false;
                 match b {
+                    b'?' => {
+                        self.help = true;
+                        self.draw_help();
+                    }
                     b'.' => return Some(Exit::Detach),
                     ESC_BYTE => self.input.extend_from_slice(&[ESC_BYTE, ESC_BYTE]),
                     b'h' | b'[' => self.input.extend_from_slice(&[ESC_BYTE, b'h']),
@@ -1562,7 +1599,39 @@ impl Client {
         self.draw_status();
     }
 
+    /// The key map, drawn over the screen after every frame until a key comes.
+    fn draw_help(&mut self) {
+        const LINES: [&str; 7] = [
+            "Ctrl-^ .  detach; the session keeps running",
+            "Ctrl-^ h  history: arrows, PgUp/PgDn, g/G, / then n/N, q",
+            "Ctrl-^ ?  this help",
+            "Ctrl-^ Ctrl-^  a literal Ctrl-^",
+            "Ctrl-V    paste files or an image from the clipboard",
+            "Ctrl-C    cancel an upload in progress",
+            "any key   close this help",
+        ];
+        let (cols, rows) = (self.cols as usize, self.rows as usize);
+        if cols < 40 || rows < LINES.len() + 4 {
+            return;
+        }
+        let w = LINES.iter().map(|l| l.chars().count()).max().unwrap_or(0).min(cols - 4);
+        let border = format!("+{}+", "-".repeat(w + 2));
+        let mut s = String::from("\x1b7\x1b[0;36m");
+        s.push_str(&format!("\x1b[2;1H{border}"));
+        for (i, l) in LINES.iter().enumerate() {
+            let text: String = l.chars().take(w).collect();
+            s.push_str(&format!("\x1b[{};1H| {:<w$} |", i + 3, text, w = w));
+        }
+        s.push_str(&format!("\x1b[{};1H{border}\x1b[0m\x1b8", LINES.len() + 3));
+        let _ = self.out.write_all(s.as_bytes());
+        let _ = self.out.flush();
+    }
+
     fn draw_status(&mut self) {
+        if self.help {
+            self.draw_help();
+            return;
+        }
         let Some(text) = &self.status_text else { return };
         let text: String = if text.starts_with(' ') { text.clone() } else { format!(" {text}") };
         let text: String = text.chars().take(self.cols as usize).collect();
